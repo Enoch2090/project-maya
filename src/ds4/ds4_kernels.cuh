@@ -120,7 +120,7 @@ void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float*
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s);
 /// The same for T activations x[t] = x + t ldx into y + t ldy, each weight read once for all of them; each output is
 /// gemv_f16's bit for bit.
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 /// (DS4_PROMPT_F16) rows of n values an FP16-out GEMM left as FP16 at the start of each FP32 row (ldy floats apart), widened
 /// in place (exact); count_bad: the values that are not finite counted (widen_bad_take, the current device)
 void widen_rows_f16(float* y, int n, size_t ldy, int rows, cudaStream_t s, int count_bad = 0);
@@ -516,7 +516,7 @@ constexpr int kAr2Piece = 8192;   // (float4s a piece: 128 KB of F32 rows, 64 KB
 void tab_set(const unsigned long long* pairs, int n, cudaStream_t s);
 /// A group of two with pflags (DS4_AR2): ar2_kernel, the put and the sums in one pipelined launch
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || defined(DS4_CUDA_PEER_AR)
 constexpr int kPeerArBlocks = 64, kPeerArFlagStride = 32;
 // Optional diagnostic written only by the first block to set the timeout bit.
 struct PeerArFailure {

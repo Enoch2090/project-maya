@@ -8,14 +8,14 @@
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/glm_batch.hpp"   // mla_decode_v70 (Volta)
 #include "strata/kernels/exl3.hpp"
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include "strata/kernels/glm_expert_bench.hpp"
 #include <cstring>
 #endif
 #include "strata/kernels/glmd_random_route.hpp"   // glm-dsa B15.7
 #include "strata/core/glm_req_knobs.hpp"   // glm-dsa request knobs
 
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include <cuda_bf16.h>
 #endif
 #include <cuda_fp16.h>
@@ -53,7 +53,7 @@ __device__ __forceinline__ float __ldcg(const float* p) {
 #define STRATA_GRID_CONSTANT
 #endif
 // the device pass for cc 6.0 (Tesla P100 / PH402, GP100: no dp4a, the SIMD-in-word intrinsics emulated)
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(STRATA_USE_HIP)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #define GLMF_SM60 1
 #else
 #define GLMF_SM60 0
@@ -77,7 +77,7 @@ __device__ __forceinline__ float warp_max_shfl(float v) {
 // across the VALU's lanes on RDNA3 (v_permlanex16 with the identity selects for ^16: a row's lane i reads lane i of the
 // other row; DPP row_xmask for 8, 4, 2, 1) instead of through LDS (__shfl_xor_sync is a ds_bpermute on AMD): the same
 // operations on the same values in the same order, so the same bits (glm_attn_bench checks it); elsewhere the shuffles
-#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__) || defined(__gfx906__))
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && (defined(__GFX11__) || defined(__GFX12__) || defined(__gfx906__))
 template<int Mask> __device__ __forceinline__ float lane_swizzle(float v) {
     return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), Mask));
 }
@@ -125,14 +125,14 @@ __device__ __forceinline__ float warp_sum_lanes(float v) { return warp_sum_shfl(
 __device__ __forceinline__ float warp_max_lanes(float v) { return warp_max_shfl(v); }
 #endif
 __device__ __forceinline__ float warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
     return warp_sum_lanes(v);
 #else
     return warp_sum_shfl(v);
 #endif
 }
 __device__ __forceinline__ float warp_max(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
     return warp_max_lanes(v);
 #else
     return warp_max_shfl(v);
@@ -815,7 +815,7 @@ template<> __device__ __forceinline__ float dw<19>(const uint8_t* row, int kbx, 
     const float delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f * IQ1S_DELTA / 0x8000);
     return d1q * (x.d * sumi + x.s * delta);
 }
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // Fast bit-parallel sign expansion for HIP (gfx906/gfx11/gfx12) where __vcmpne4/__vsub4 are software-emulated.
 // Every IQ2/IQ3 grid byte is nonzero and <= 62, so two's-complement negation uses a whole-word add without carries.
 __device__ __forceinline__ uint4 hip_fast_signs(unsigned b, bool parity) {
@@ -835,7 +835,7 @@ template<> __device__ __forceinline__ float dw<16>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         const uint4 sgn = hip_fast_signs(aux32 >> (7 * k0 / 2), true);
         sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[k0 + 0], sumi);
         sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[k0 + 1], sumi);
@@ -860,7 +860,7 @@ template<> __device__ __forceinline__ float dw<18>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         const uint4 sgn = hip_fast_signs(aux32 >> (7 * l0 / 2), true);
         sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[l0 + 0], sumi);
         sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[l0 + 1], sumi);
@@ -902,7 +902,7 @@ template<> __device__ __forceinline__ float dw<17>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[q2[l0 / 2] & 0x1FF];
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         const uint4 sgn = hip_fast_signs(q2[l0 / 2] >> 9, true);
         const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
         const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
@@ -937,7 +937,7 @@ template<> __device__ __forceinline__ float dw<22>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)];
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         const uint4 sgn = hip_fast_signs(signs_packed_8[l0 / 2], false);
         const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
         const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
@@ -971,7 +971,7 @@ template<> __device__ __forceinline__ float dw<21>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(tab[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)], tab[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         const uint4 sgn = hip_fast_signs(signs_packed_8[l0 / 2], false);
         const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
         const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
@@ -1134,7 +1134,7 @@ template<> __device__ __forceinline__ float dws<21>(const uint8_t* row, int kbx,
 // a four-bit sign nibble by 0x10204080 puts its bits at each byte's high bit;
 // after masking/shifting, these are the +1 corrections and *255 gives the masks.
 // The integer scale divisions and floating-point accumulation order stay intact.
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 __device__ __forceinline__ uint4 direct_signs(unsigned b, bool parity) {
     b &= parity ? 127u : 255u;
     if (parity) b |= (__popc(b) & 1) << 7;
@@ -1456,9 +1456,11 @@ constexpr int MV_ROWS = 8;   // rows (warps) per block
 // depended on the instantiation), so a batched output could differ in its last bit from the same one alone.  Without a
 // bias (every call of the decode) both ways give the same bits.
 __device__ __forceinline__ float mv_out(float alpha, float s, float bias) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     float m = alpha * s;
+#if !defined(STRATA_USE_MUSA)   // (MUSA's clang has no 'v' operand; -ffp-contract=off keeps the product materialised)
     asm volatile("" : "+v"(m));   // the product materialised: never fused with the sum
+#endif
     return m + bias;
 #else
     return __fadd_rn(__fmul_rn(alpha, s), bias);
@@ -1670,7 +1672,7 @@ __global__ void __launch_bounds__(256) mv_kernel_t_nt(const STRATA_GRID_CONSTANT
 constexpr int MMA_W = 8;   // warps a block
 
 __global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q8_0(const STRATA_GRID_CONSTANT MvBatch b) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(STRATA_USE_HIP)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (b.skip != nullptr && *b.skip) return;
     __shared__ float red[MMA_W][16][kMaxMvCols + 1];
     const int bid = blockIdx.x;
@@ -1755,7 +1757,7 @@ __global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q8_0(const STRATA_GRID_CON
 // consecutive values - one 8-byte load of the packed pair of sub-blocks, the activations in the same order.  The
 // dp4a kernel re-reads every column's activations for each pair of rows (8 columns: ~half the memory's speed)
 __global__ void __launch_bounds__(MMA_W * 32) mvc_mma_q4_K(const STRATA_GRID_CONSTANT MvBatch b) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(STRATA_USE_HIP)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (b.skip != nullptr && *b.skip) return;
     __shared__ float red[MMA_W][16][kMaxMvCols + 1];
     const int bid = blockIdx.x;
@@ -1917,7 +1919,7 @@ void mvc_launch(const MvBatch& b, int blocks, int nc, cudaStream_t s) {
 
 // whether this device has the int8 mma.sync of the tensor-core GEMVs (NVIDIA sm_80+), asked once per device
 bool mma_arch() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return false;
 #else
     static int cache[64];
@@ -1936,7 +1938,7 @@ bool mma_arch() {
 
 // whether this device runs mvc_mma_q8_0 (NVIDIA sm_80+), asked once per device
 bool mma_ok() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return false;
 #else
     static int cache[64];
@@ -1966,7 +1968,7 @@ bool mma_ok() {
 // (R = 2), the FFN 12288 x 4096 287 -> 204, the head 154880 x 4096 3466 -> 2362.
 // p100_mv_mode: 0 off (mv_kernel_t; MAYA_GLM_MV_P100=0), else R by the launch's rows (MAYA_GLM_MV_P100_R=2 / 4
 // forces one), asked once per device
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // a Q6_K block's 53 words, two a lane: w0 = word lane, w1 = word 32 + lane (lanes 0-20) of the words starting sh = the
 // block's address mod 4 (0 or 2) bytes before it; its first / last half word read as a half, so nothing outside the
 // block is read
@@ -2050,7 +2052,7 @@ __global__ void __launch_bounds__(256) mv_q6_p100_kernel(const STRATA_GRID_CONST
 #endif
 // moe_gate_up on cc 6.0 stages the layer input in shared memory (MAYA_GLM_GU_STAGE=0: it reads it from global)
 bool sm60_gu_stage() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return false;
 #else
     static int cache[64];
@@ -2068,7 +2070,7 @@ bool sm60_gu_stage() {
 #endif
 }
 int p100_mv_mode() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return 0;
 #else
     static int cache[64];
@@ -2146,7 +2148,7 @@ __global__ void __launch_bounds__(256) mvc_kernel_bf16(const STRATA_GRID_CONSTAN
 }
 #include "glmd_mv_ext.cuh"   // glm-dsa B10.6/B10.7: more mv types and the sm_70 GEMV variants (ext_mv)
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // ---------------------------------------------------------------- the dense GEMV on RDNA3 (gfx11)
 // Q6_K is ~64% of a decode token's bytes (Maya-S: the KDA/DSA projections, the shared experts, the dense FFN and the
 // head), and on a Radeon 8065S row_dot<14> ran them at 165-220 GB/s of the 273 the LPDDR5X gives: its loop is not
@@ -2190,7 +2192,7 @@ __device__ __forceinline__ int q6_idot(int q, int u) {
     return __builtin_amdgcn_sudot4(true, (int) 0xe0e0e0e0u, true, u, __builtin_amdgcn_sudot4(false, q, true, u, 0, false),
                                    false);
 #else
-    return __dp4a(__vsubss4(q, 0x20202020), u, 0);
+    return __dp4a((int) __vsubss4(q, 0x20202020), (int) u, 0);   // (the casts pick the int overload)
 #endif
 }
 // dot_q6_K's float arithmetic, term for term (the same products, sums and order)
@@ -3529,7 +3531,7 @@ __global__ void __launch_bounds__(128) mla_split_mma_kernel(const float* __restr
                                                             const uint16_t* __restrict__ lat,
                                                             const int* __restrict__ cells, int64_t c_stride, MlaToks nt,
                                                             int n_head, int qk_nope, float* __restrict__ part, bool q8) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(STRATA_USE_HIP)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     extern __shared__ uint4 smem4[];
     uint16_t* sL = (uint16_t*) smem4;                       // MLA_CHUNK x MLA_ROW
     float* sS = (float*) (sL + MLA_CHUNK * MLA_ROW);        // per warp: 16 heads x MLA_CHUNK partial scores
@@ -4764,7 +4766,7 @@ constexpr int GU_WARPS = 16;  // ... 2 gate + 2 up rows per warp (8 per warp mea
 
 // grid (n_ff / GU_ROWS, k [+ 1]): the extra row of blocks (blockIdx.y == k) computes the SHARED expert's down rows
 // into sh_out while the routed experts' blocks run - in moe_down it was a serial tail (~25 us of 72)
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 template<int TG, int NW = GU_WARPS, bool LUT = false, bool GLOBAL = false, bool SPLIT = false,
          bool DIRECT = false, bool WIDE = false, int MINWAVES = 0, bool MULTI = false>
 __attribute__((amdgpu_waves_per_eu(MINWAVES > 0 ? MINWAVES : 1)))
@@ -4780,7 +4782,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
                                                                     const block_q8_1* __restrict__ sh_hq, int n_ff_sh,
                                                                     float* __restrict__ sh_out) {
     if (d.skip != nullptr && *d.skip) return;
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     constexpr int NW = GU_WARPS;
     const int ei = blockIdx.y, chunk = blockIdx.x, n_chunks = (int) gridDim.x;
 #else
@@ -4800,7 +4802,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     }
 #endif
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if constexpr (!SPLIT)
 #endif
     if (ei == k) {
@@ -4833,7 +4835,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
         }
     }
 #endif
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     __shared__ uint4 s_sign[LUT && !DIRECT ? sign_count<TG> : 1];
     if constexpr (LUT && !DIRECT) load_signs<TG>(s_sign);
     if constexpr (!GLOBAL)
@@ -4853,7 +4855,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     }
     float s[2 * RPW];
     const uint32_t* tab = s_tab;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if constexpr (GLOBAL) tab = TG == 16 ? (const uint32_t*) iq2xxs_grid :
                                 TG == 18 ? (const uint32_t*) iq3xxs_grid : (const uint32_t*) iq2s_grid;
     if constexpr (LUT) {
@@ -4881,7 +4883,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
 
 constexpr int DOWN_ROWS = 4;
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 template<int TD, int NR = DOWN_ROWS, bool LUT = false, bool GLOBAL = false, bool DIRECT = false, bool WIDE = false,
          bool MULTI = false>
 #else
@@ -4891,7 +4893,7 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
                                                        const block_q8_1* __restrict__ hq,
                                                        const float* __restrict__ sh_out, float* __restrict__ out) {
     if (d.skip != nullptr && *d.skip) return;
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     constexpr int NR = DOWN_ROWS;
     const int rb0 = blockIdx.x;
 #else
@@ -4920,7 +4922,7 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     __shared__ __align__(16) uint32_t s_sg[sm60_sign_on<TD> ? sm60_sign_n<TD> * sm60_sign_w<TD> : 1];
     if constexpr (sm60_sign_on<TD>) sm60_load_signs<TD>(s_sg);
 #endif
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     __shared__ uint4 s_sign[LUT && !DIRECT ? sign_count<TD> : 1];
     if constexpr (LUT && !DIRECT) load_signs<TD>(s_sign);
     if constexpr (!GLOBAL)
@@ -4941,7 +4943,7 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
 #pragma unroll
             for (int j = 0; j < NR; ++j) rows[j] = (const uint8_t*) s_ptr[warp] + down_off + (size_t) (r0 + j) * drb;
             const uint32_t* tab = s_tab;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
             if constexpr (GLOBAL) tab = TD == 16 ? (const uint32_t*) iq2xxs_grid :
                                         TD == 18 ? (const uint32_t*) iq3xxs_grid : (const uint32_t*) iq2s_grid;
             if constexpr (LUT) {
@@ -5493,7 +5495,7 @@ size_t row_bytes(int type, int64_t n_in) {
     }
 }
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 namespace {
 // The RDNA3 GEMV's shape: R rows per wave, U super-blocks in flight, WPB waves per block, the Q6_K activations in LDS
 // or not.  The bench sets it (hip_expert_bench::mv_config); r == 0 is the original kernels, r < 0 the default: one row
@@ -5531,8 +5533,20 @@ bool mv_rdna_device() {
     if (cached_device != device) {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
+#if defined(STRATA_USE_MUSA)
+        // MUSA: there is no gfx architecture string to match (the compat layer maps gcnArchName onto the card's
+        // name), so the ARC that used to say "these kernels fit this card" cannot answer here.  These kernels are
+        // the in-flight-load ones: many independent 16 B weight reads per lane, which is what a bandwidth-bound
+        // single-token decode on this part needs.  MAYA_GLM_MV_RDNA decides (unset/1: on - measured below).
+        on = mode >= 0;
+        if (mode < 0) {
+            const char* d = std::getenv("MAYA_GLM_MV_MUSA");
+            on = d == nullptr || d[0] != '0';   // (default on; MAYA_GLM_MV_MUSA=0 keeps the original kernels)
+        }
+#else
         on = std::strncmp(prop.gcnArchName, mode > 0 ? "gfx11" : "gfx115", mode > 0 ? 5 : 6) == 0 ||
              std::strncmp(prop.gcnArchName, "gfx12", 5) == 0;
+#endif
         cached_device = device;
         note_mv(device, on);
     }
@@ -5698,7 +5712,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         for (int i = 0; i < n; ++i) all = all && done[i];
         if (all) return true;
     }
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // (one-column batches only: a verify window's several-column jobs go to the tiled kernels below)
     bool one_col = true;
     for (int i = 0; i < n; ++i) one_col = one_col && jobs[i].ncol == 1;
@@ -5846,7 +5860,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             // launch of fewer than 1024 rows, and an activation over 48 KB, keep mv_kernel_t)
             int pr = 0;
             size_t xs_bytes = 0;
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
             if (T == 14) {
                 if (const int mode = p100_mv_mode(); mode > 0) {
                     int rows = 0, max_in = 0;
@@ -5870,7 +5884,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
                 }
             if (m == 0) continue;
             b.n = m;
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
             if (pr > 0) {
                 if (pr == 2) mv_q6_p100_kernel<2><<<acc, 256, xs_bytes, s>>>(b);
                 else mv_q6_p100_kernel<4><<<acc, 256, xs_bytes, s>>>(b);
@@ -5982,7 +5996,7 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
                 if (!mv(one, k, s)) return false;
                 continue;
             }
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
             if (typed) mv_rdna(part, n, w, pd, s);
 #endif
             switch (w) {
@@ -5998,7 +6012,7 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
         launch_check("mv_nt");
         return true;
     }
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (typed) mv_rdna(jobs, n, nt, done, s);   // (RDNA3: its Q6_K and BF16 kernels take NT activations already)
 #endif
     switch (nt) {
@@ -6370,7 +6384,7 @@ void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaSt
 static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head,
                              int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8, bool token = false);
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 namespace {
 __global__ void lanes_kind_kernel(int* out) { *out = kLaneSum ? 1 : 0; }
 __global__ void warp_reduce_check_kernel(const float* __restrict__ in, float* sum_shfl, float* sum_lanes, float* max_shfl,
@@ -6475,7 +6489,7 @@ static bool mla_mma_on(int dev) {
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         const char* v = getenv("MAYA_GLM_MLA_MMA");
         bool on = major >= 8 && (v == nullptr || std::atoi(v) != 0) && getenv("MAYA_GLM_MLA_ATTN1") == nullptr;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         on = false;
 #endif
         if (on && cudaFuncSetAttribute(mla_split_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -6800,7 +6814,7 @@ __global__ void moe_pf_wait_kernel(const unsigned int* need, const unsigned int*
     if (n == 0u) return;
     for (long long i = 0; i < (1ll << 27); ++i) {
         if ((int) (*(volatile const unsigned int*) flag - n) >= 0) return;
-#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700   // (Pascal: no __nanosleep, a plain spin)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700   // (Pascal: no __nanosleep, a plain spin)
         __nanosleep(200);
 #endif
     }
@@ -6846,7 +6860,7 @@ void moe_cpu_wait_rows(const CpuWaitRows& w, int n, int n_embd, cudaStream_t s) 
     launch_check("moe_cpu_wait_rows");
 }
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 namespace {
 // Limit automatic dispatch to the measured decode geometry and RDNA3/3.5
 // targets (plus opt-in gfx906 when allow_gfx906 is set via MAYA_GLM_GU22_TUNED=1).
@@ -6867,10 +6881,23 @@ bool rdna3_expert_device(bool allow_gfx1151 = true, bool allow_gfx906 = false) {
     if (cached_device != device) {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
+#if defined(STRATA_USE_MUSA)
+        // MUSA has no gfx arch string - the compat layer maps gcnArchName onto the card's name, so every one of the
+        // four tests below is false and the tuned expert kernels (LUT codebook in shared memory, DIRECT signs, 16
+        // rows a block) never ran: the MoE was 43% of a decode token on the slow path.  The tuned kernels are the
+        // 32-lane in-flight-load ones these cards want, so the gate answers yes unless MAYA_GLM_MUSA_EXPERTS=0.
+        const char* off = std::getenv("MAYA_GLM_MUSA_EXPERTS");
+        const bool on = off == nullptr || off[0] != '0';
+        gfx1100 = on;
+        gfx1151 = false;
+        gfx120x = false;
+        gfx906 = false;
+#else
         gfx1100 = std::strncmp(prop.gcnArchName, "gfx1100", 7) == 0;
         gfx1151 = std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
         gfx120x = std::strncmp(prop.gcnArchName, "gfx120", 6) == 0;
         gfx906 = std::strncmp(prop.gcnArchName, "gfx906", 6) == 0;
+#endif
         cached_device = device;
     }
     return gfx1100 || gfx120x || (allow_gfx1151 && gfx1151) || (allow_gfx906 && gfx906);
@@ -6935,7 +6962,7 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
                  const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s) {
     MoeDev d = d_in;
     d.skip = g_skip;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true, gu_type == 22 && gu22_tuned());
     if (gu_type == 22) note_gu22(tuned, 0);
     if (tuned) {
@@ -6975,7 +7002,7 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     launch_check("moe_gate_up");
 }
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 namespace hip_expert_bench {
 
 void gate_up(Variant v, int type, const MoeDev& d, int k, int n_embd, int n_ff, float limit,
@@ -7057,7 +7084,7 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
               const float* sh_out, float* out, cudaStream_t s) {
     MoeDev d = d_in;
     d.skip = g_skip;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // IQ3_XXS down regresses on gfx1151; let it use the original dispatch below.
     if ((d_type == 22 || d_type == 18) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
         // Two rows lower the register budget; IQ2_S prefers global grid reads,
@@ -7087,7 +7114,7 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
 bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, float limit,
                        size_t down_off, const void* xq, void* hq, const void* sh_down, int sh_type, const void* sh_hq,
                        int n_ff_sh, float* sh_out, float* out, cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     MoeDev d = d_in;
     d.skip = g_skip;
     const int T = d.mt_T;

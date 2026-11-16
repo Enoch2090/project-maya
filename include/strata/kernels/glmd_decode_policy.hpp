@@ -98,7 +98,7 @@ inline DecodePolicy decode_policy_env() {
 /// there the fused MLA and the WMMA scorer stay off whatever the switches say (mla2 and the CUDA-core scorer run; the
 /// radix top-k is portable).  A CUDA build: p unchanged.
 inline DecodePolicy decode_policy_built(DecodePolicy p) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     p.fused_mla = false;
     p.idx_wmma = kSwitchOff;
 #endif

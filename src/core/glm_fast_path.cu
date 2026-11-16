@@ -45,7 +45,7 @@
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include <nvtx3/nvToolsExt.h>
 #endif
 
@@ -75,14 +75,14 @@
 #endif
 #include <windows.h>
 #include <psapi.h>
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include <dxgi.h>
 #else
 #include <dxgi1_4.h>
 #endif
 #include "strata/platform/commit.hpp"
 #include "strata/platform/dedicated.hpp"
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include "strata/platform/gpu_shared.hpp"
 #endif
 #endif
@@ -97,7 +97,7 @@ namespace gf = strata::kernels::glmf;
 // NON_LOCAL is the process's WDDM system-memory budget, not free VRAM.
 // Match CUDA's adapter by LUID; adapter 0 need not be the CUDA device.
 static bool glm_pin_budget(int device, uint64_t& budget, uint64_t& usage) {
-#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+#if defined(_WIN32) && !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     cudaDeviceProp prop{};
     if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
         cudaGetLastError();
@@ -134,7 +134,7 @@ static bool glm_pin_budget(int device, uint64_t& budget, uint64_t& usage) {
 #endif
 }
 
-#if defined(STRATA_USE_HIP) && defined(_WIN32)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(_WIN32)
 // A Windows APU's room for more pinned buffers (strata/platform/gpu_shared.hpp): its shared GPU memory, less what all
 // its users hold of it now (the desktop's, this process's pinned buffers, its device memory past the carve-out), less
 // `later` (pinned after this measurement), less glmfast::apu_shared_margin (an eighth of the limit, at least 1 GB: the
@@ -176,7 +176,7 @@ static int64_t apu_shared_room(int dev, int64_t later) {
 // RTX 4070 Ti SUPER / 5070 Ti), and copies alone do not wake it, so a link timed at idle reads 3-8x slower than it
 // runs during decode (Tesla cards keep the link up, so this never showed there).
 static __global__ void glm_link_wake(unsigned long long ns) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // no PTX %globaltimer on AMD: wall_clock64() is the constant 100 MHz counter (10 ns a tick) on gfx11 / gfx12, and
     // a wake-up spin needs no exact timing (from @boxwrench, #24)
     const long long t0 = wall_clock64();
@@ -1138,7 +1138,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     // (gf::ring_entries_for / ring_stride_for): GLM-5.3-Flash 64 entries of 4096 floats, glm-dsa 128 of 6144 - a decode
     // round's routes (every layer once + a verify window's drafts) fit as before, the host-mapped footprint 1 / 3 MB
     // instead of 8.4 MB (on the gfx1151 APU the big ring cost the Flash drafting decode ~0.8 %)
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     F->md.ring_n = gf::ring_entries_for(NL + kWinMax);
     F->md.ring_stride = gf::ring_stride_for(g.n_embd);
 #else
@@ -1896,7 +1896,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                     budget = std::min<int64_t>(budget, std::max<int64_t>(0, now - unpinned - head_b / 2 - unseen_pf));
             }
         }
-#if defined(STRATA_USE_HIP) && defined(_WIN32)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(_WIN32)
         // glm-dsa: on a Windows APU the tier, the disk staging pinned below and the room kept above them are shared GPU
         // memory, which Windows caps over all its users and HIP does not refuse past (apu_shared_room): GLM-5.3's
         // default 13.3 GB tier on a Radeon 8065S stopped the start
@@ -1998,7 +1998,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // at a pinning cap's first refusal the room left under it is measured (pin_room), and from there on each class
         // takes its planned share of what is left - less the room kept above the tier (glmfast::pin_cap_room: 512 MB;
         // a discrete AMD card under Windows a tenth of the cap, #924 - until the cap is reached, of what is pinned)
-#if defined(STRATA_USE_HIP) && defined(_WIN32)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(_WIN32)
         const bool amd_room = !F->unified_memory;
 #else
         const bool amd_room = false;
@@ -2249,7 +2249,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
             if (tier_node >= 0 && seen > 0 && agree) {
                 int host_node = -1;
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
                 // cudaDevAttrHostNumaId (134) by its value: CUDA 12.0 and 12.1 do not name it
                 if (cudaDeviceGetAttribute(&host_node, (cudaDeviceAttr) 134, dev_) != cudaSuccess || host_node < 0) {
                     host_node = -1;   // not reported on Volta + 582.78
@@ -5040,7 +5040,7 @@ void Glm5Model::fast_service() {
     };
     unsigned int polls = 0;
     const unsigned int ring_n = F->md.ring_n, ring_stride = F->md.ring_stride;   // (fast_setup: the ring's shape)
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     auto last_kick = last_route;
     unsigned int kick_polls = 0;
 #endif
@@ -5057,7 +5057,7 @@ void Glm5Model::fast_service() {
                 next = sq;
             } else {
                 F->svc_phase.store(0, std::memory_order_relaxed);
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
                 // Windows' HIP runtime submits queued launches only when the host waits on the GPU (Linux submits
                 // each): a route the main thread queued can sit there while this thread waits for it.  After 1 ms
                 // without a route, submit what is queued - cudaStreamQuery does without waiting (not while a graph is
@@ -7184,7 +7184,7 @@ Glm5Model::PoolBudget Glm5Model::part_budget(size_t free_b, size_t total_b, size
 // Nor is a budget beyond all the pool can ever take (all_b: every expert of this part's layers with the spares and a
 // prompt's room): such a pool cannot fill the card, and writing the whole budget - a Windows APU's carve-out, a Radeon
 // 8065S's ~157 GB for Maya-S's ~106 - three times over took a start from ~60 to ~120 s.
-#if defined(STRATA_USE_HIP) && defined(_WIN32)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(_WIN32)
 // The dedicated video memory DXGI reports for the adapter with this HIP device's LUID (an APU: its carve-out), 0 when
 // unknown.  MAYA_GLM_APU_DEDICATED_GB=<n> sets it (a test: a smaller carve-out), =0 turns the cap below off.
 static size_t win_dedicated_bytes(int dev) {
@@ -7208,7 +7208,7 @@ void Glm5Model::pool_check(size_t floor_b, size_t slot_b, size_t all_b) {
     // budget went with it and the start failed
     int integrated = 0;
     if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev_) != cudaSuccess) cudaGetLastError();
-#if defined(STRATA_USE_HIP) && defined(_WIN32)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(_WIN32)
     // ... but it is kept within its DEDICATED memory: HIP's total there is the carve-out plus ~12 GB of shared system
     // memory, and a pool that fills into the shared part pages under Windows - a 96 GB carve-out with v1.1.10's
     // complete pool held 13.1 + 89.5 GB, and 8K-token prompts ran at 62 instead of 159 tok/s (#206).  What is in use
@@ -8148,7 +8148,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         const auto t = std::chrono::steady_clock::now();
         tp[i] += std::chrono::duration<double, std::milli>(t - tnow).count();
         tnow = t;
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         nvtxRangePop();
         nvtxRangePushA(lap_names[next]);
 #else
@@ -8159,7 +8159,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     // MAYA_GLM_NSYS=<from>,<to>: a profiler capture window over those steps (nsys --capture-range=cudaProfilerApi)
     int64_t nsys_from = -1, nsys_to = -1;
     if (const char* ns = getenv("MAYA_GLM_NSYS")) std::sscanf(ns, "%lld,%lld", (long long*) &nsys_from, (long long*) &nsys_to);
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (sprof) nvtxRangePushA("emit");
 #endif
     for (;;) {

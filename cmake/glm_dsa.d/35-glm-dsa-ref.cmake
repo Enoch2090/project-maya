@@ -1,6 +1,6 @@
 # B3.5 / B3.6: the glm-dsa F32 reference forward (Glm5Model::step_layers_dsa, the MAYA_GLM_SLOW path) and its tests.
 if(TARGET strata_engine)
-  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA)
     target_sources(strata_engine PRIVATE src/core/glm_dsa_ref.cu src/core/glm_dsa_ref_host.cpp)
   else()
     # glm_model.cu dispatches glm-dsa here on every backend; without the GPU reference kernels it refuses cleanly
@@ -19,7 +19,7 @@ if(STRATA_BUILD_TESTS)
 
   # B3.6: SMALL / BIG / LONG synthetic glm-dsa GGUFs through the slow path vs the oracle's logits (needs a GPU and
   # the B3.1 / B3.2 tools; skips with code 77 otherwise).
-  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
     add_executable(glm_dsa_model_test tests/glm_dsa/glm_dsa_model_test.cpp)
     target_include_directories(glm_dsa_model_test PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(glm_dsa_model_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})

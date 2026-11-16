@@ -17,7 +17,7 @@ endif()
 # caches and decode alike on a synthetic pack, as built, with FP16 index keys, with every Volta switch forced and the
 # decode graphs on, and on a pack that keeps W_kb / W_vb native Q8_0 (MAYA_PACK_NATIVE32).  (HIP: the _volta case's
 # WMMA switches have no kernel there - the decode policy keeps the fused MLA and the WMMA scorer off.)
-if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
   add_executable(glm_dsa_prefill_decode_test tests/glm_dsa/glm_dsa_prefill_decode_test.cpp)
   target_include_directories(glm_dsa_prefill_decode_test PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(glm_dsa_prefill_decode_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})

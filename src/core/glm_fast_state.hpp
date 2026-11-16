@@ -134,7 +134,7 @@ inline void cpu_relax() {
 // the default: on the 8065S (Maya-S, drafting with the MTP rework) a submission every 4 layers lost ~4% of the decode
 // (26.5 against 27.7 tok/s, same answers); the runtime's own batching plus the service thread's kick keep the GPU fed.
 inline void submit_queued(cudaStream_t s) {
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (cudaPeekAtLastError() != cudaSuccess) return;
     const cudaError_t e = cudaStreamQuery(s);
     if (e == cudaErrorNotReady || e == cudaSuccess) (void) cudaGetLastError();
@@ -143,7 +143,7 @@ inline void submit_queued(cudaStream_t s) {
 #endif
 }
 inline int submit_every() {
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     static const int v = [] {
         const char* e = getenv("MAYA_GLM_FLUSH");
         return e != nullptr ? std::max(0, std::atoi(e)) : 0;
@@ -157,7 +157,7 @@ inline int submit_every() {
 // default: Maya-S on the 8065S, 2K / 8K / 16K prompts 271 / 323 / 325 tok/s with it against 273-276 / 323-325 /
 // 329-339 without - the sub-batches are long enough that the runtime's batching costs nothing)
 inline bool prefill_submit() {
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     static const bool v = [] {
         const char* e = getenv("MAYA_GLM_PREFILL_FLUSH");
         return e != nullptr && std::atoi(e) != 0;

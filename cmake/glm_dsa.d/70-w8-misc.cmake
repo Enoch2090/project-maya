@@ -7,7 +7,7 @@ if(TARGET strata_engine)
   target_sources(strata_engine PRIVATE src/core/glm_prompt_cache.cpp src/core/glm_ngram_draft.cpp
                                        src/core/glm_prompt_cache_engine.cpp)
   # glm_prompt_cache_engine.cpp (every backend) calls its members; portable runtime calls only (HIP: hip_compat)
-  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA)
     target_sources(strata_engine PRIVATE src/core/glm_prompt_cache_model.cu)
   endif()
 endif()
@@ -51,7 +51,7 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME glm_idx_hadamard_cpu_test COMMAND glm_idx_hadamard_cpu_test)
   endif()
 
-  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
     # GPU (label gpu, exit 77 without a device): topk_hist and the rotated prep / rope against the twins.
     add_executable(glmd_w8_parity tests/glm_dsa/glmd_w8_parity.cu)
     target_link_libraries(glmd_w8_parity PRIVATE strata_engine)

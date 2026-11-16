@@ -6,7 +6,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/glm_batch.hpp"
 #include "strata/prefill/moe_mmq.hpp"
-#if defined(STRATA_USE_HIP) && defined(STRATA_HIP_PREFILL_FUSED)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(STRATA_HIP_PREFILL_FUSED)
 #include "strata/prefill/moe_fused_rdna4.hpp"
 #endif
 
@@ -858,7 +858,7 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
     // The layer waits for this GPU on the CPU pool's critical path: spin instead of sleeping, whose wake-up
     // costs more than a small expert batch takes (measured: ~0.3 ms per round trip on Windows).  Only possible
     // before the device's context exists, so first thing; MAYA_REMOTE_SPIN=0 keeps the driver's default.
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     const char* spin = std::getenv("MAYA_REMOTE_SPIN");
     if (!(spin && spin[0] == '0')) cudaInitDevice(device, cudaDeviceScheduleSpin | cudaDeviceMapHost, 0);
     cudaGetLastError();
@@ -1180,7 +1180,7 @@ bool GlmExpertHelper::pf_attach(uint8_t* host, size_t bytes, int cap_tokens, std
 // the helper's prompt product for a layer's expert types: 1 the fused kernel (gate/up and down), 2 MMQ's gate/up and the
 // fused down, 0 MMQ, -1 none.  pf_type_bits: a type's part of that for kOpen's answer (hlink::Ctl::pf_types).
 static bool pf_fused_here(int n_embd, int n_ff) {
-#if defined(STRATA_USE_HIP) && defined(STRATA_HIP_PREFILL_FUSED)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(STRATA_HIP_PREFILL_FUSED)
     static const bool env = [] {
         const char* v = std::getenv("MAYA_GLM_LINK_PF_FUSED");
         return v == nullptr || std::atoi(v) != 0;
@@ -1195,7 +1195,7 @@ static bool pf_fused_here(int n_embd, int n_ff) {
 int GlmExpertHelper::pf_type_bits(int t) const {
     namespace mmq = strata::prefill::mmq;
     int bits = mmq::built() && mmq::supported(t) ? hlink::kPfMmq : 0;
-#if defined(STRATA_USE_HIP) && defined(STRATA_HIP_PREFILL_FUSED)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(STRATA_HIP_PREFILL_FUSED)
     constexpr int kAny = 16;   // (IQ2_XXS: the fused kernel takes it on either side)
     if (pf_fused_here(n_embd_, n_ff_)) {
         if (strata::prefill::rdna4::supported(t, kAny)) bits |= hlink::kPfFusedGu;
@@ -1211,7 +1211,7 @@ int GlmExpertHelper::pf_mode(int gu_type, int d_type) const {
 
 bool GlmExpertHelper::pf_run(int gu_type, int d_type, size_t down_off, float limit, bool dsa, int T, int K, int n,
                              int rows, int r0, const uint8_t* const* blobs, std::string& err, int slot) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     namespace mmq = strata::prefill::mmq;
     namespace gb = strata::kernels::glmb;
     if (pf_ == nullptr || T <= 0 || slot < 0 || slot > 2 || T > (slot > 0 ? pf_slot_cap() : pf_cap_) || K <= 0 || K > hlink::kPfMaxK || n < 0 || n > hlink::kPfMaxExperts ||

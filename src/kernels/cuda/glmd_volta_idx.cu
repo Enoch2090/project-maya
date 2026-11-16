@@ -60,7 +60,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 __device__ __forceinline__ __half half_sat(float v) { return __float2half(fmaxf(-65504.0f, fminf(65504.0f, v))); }
 
 // ---------------------------------------------------------------- B10.3 WMMA scorer (CUDA: nvcuda::wmma)
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // 8 warps x 16 cells per block, TB tokens per block (blockIdx.y), NTH = idx_heads / 16 column tiles per token.
 // Shared: the queries of the block's tokens as FP16 [TB * H][D + 8] (matrix_b, col-major), the head weights, and per
 // warp a 16 x (D + 8) FP16 key tile that becomes the warp's 16 x H f32 output scratch after the k-loop.
@@ -405,7 +405,7 @@ __global__ void __launch_bounds__(NT) topk_mb_write(const float* __restrict__ sc
 int volta_idx_launch_errors() { return g_errors.load(std::memory_order_relaxed); }
 
 bool idx_wmma_enabled() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return false;   // the WMMA scorer is a CUDA kernel: HIP builds score with the CUDA-core one
 #else
     static const bool on = env_on("MAYA_GLMD_IDX_WMMA");
@@ -414,7 +414,7 @@ bool idx_wmma_enabled() {
 }
 
 bool idx_score_wmma_supported(int idx_heads, int idx_dim) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     (void) idx_heads;
     (void) idx_dim;
     return false;   // (no WMMA scorer in a HIP build)
@@ -436,7 +436,7 @@ bool idx_score_wmma(const IdxScoreWmma& a, void* stream) {
         return false;
     }
     if (a.n_kv == 0 || a.T == 0) return true;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     (void) stream;
     return false;   // (unreachable: idx_score_wmma_supported refused above)
 #else

@@ -334,7 +334,7 @@ std::string tune_key_of(const std::vector<int>& gpus) {
     for (int id : gpus) {
         cudaDeviceProp pr{};
         if (cudaGetDeviceProperties(&pr, id) != cudaSuccess) continue;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         std::string arch = pr.gcnArchName;
         if (arch.find(':') != std::string::npos) arch.resize(arch.find(':'));
 #else
@@ -1186,7 +1186,7 @@ struct Model::Impl {
             CK(cudaSetDevice(id));
             CK(cudaStreamCreateWithFlags(&d.s, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&d.hop, cudaEventDisableTiming));
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
             if (const char* sv = ::mm3::env("MM3_SIDE"); sv == nullptr || std::atoi(sv) != 0) {
                 CK(cudaStreamCreateWithFlags(&d.s2, cudaStreamNonBlocking));
                 CK(cudaEventCreateWithFlags(&d.fev, cudaEventDisableTiming));
@@ -2885,7 +2885,7 @@ struct Model::Impl {
     // event, the host goes on enqueueing (CUDA; HIP - whose queued work Windows submits only at a host wait - and
     // MAYA_MM3_HOP_EVENTS=0: the host waits for a's stream first, as before)
     bool hop_events = [] {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         return false;
 #else
         const char* v = ::mm3::env("MM3_HOP_EVENTS");

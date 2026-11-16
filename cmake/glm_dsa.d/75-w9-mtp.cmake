@@ -6,7 +6,7 @@ if(TARGET strata_engine)
   target_sources(strata_engine PRIVATE src/core/glm_mtp_state.cpp src/core/glm_heat_evict.cpp)
   # Maya-owned glm_fast_path.cu / glm_multi.cu call its members on every GPU backend (HIP: through hip_compat; a
   # no-op off glm-dsa, as on CUDA)
-  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA)
     target_sources(strata_engine PRIVATE src/core/glm_mtp_state_model.cu)
   endif()
 endif()

@@ -44,7 +44,7 @@ if(STRATA_BUILD_TESTS)
   set_tests_properties(glm_cpu_affinity_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
-if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
   # GPU (label gpu, exit 77 without a device): the guard kernels == the twins, cuBLAS FP16 GEMMs over amax 1e5 rows
   # finite and bit-identical elsewhere, the WMMA prompt MLA with an overflowing Q tile (CUDA: the kernel is Volta's).
   add_executable(glmd_f16_guard_gpu_test tests/glm_dsa/glmd_f16_guard_gpu_test.cu)
@@ -68,7 +68,7 @@ if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET s
   set_tests_properties(glmd_graph_gen_gpu_test PROPERTIES LABELS gpu SKIP_RETURN_CODE 77)
 endif()
 
-if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_mmq AND TARGET strata_engine)
+if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_mmq AND TARGET strata_engine)
   # GPU: MMQ over a bank whose bytes past the last expert's 512-B zero tail, and whose slot gaps before mmq_zero_gaps,
   # are NaN: finite and equal to the clean bank (B15.2).
   add_executable(glmd_mmq_pad_gpu_test tests/glm_dsa/glmd_mmq_pad_gpu_test.cu)

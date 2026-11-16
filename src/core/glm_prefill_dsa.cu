@@ -39,7 +39,7 @@
 #include "strata/kernels/glmd_forward.hpp"
 #include "strata/kernels/glmd_route.hpp"
 #include "strata/kernels/iq_kernels.hpp"
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include "strata/prefill/gemm.hpp"   // (the hipBLASLt projections, S7)
 #endif
 #include "strata/prefill/moe_mmq_strata.hpp"
@@ -54,7 +54,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include <mutex>
 #endif
 
@@ -199,7 +199,7 @@ bool built() { return true; }
 
 bool mmq_ok(const Glm5Geometry& g, int type) {
     if (g.arch != GlmArch::GlmDsa) return true;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // B14.2's check is about CUDA's sm_70 instances (NO_DEVICE_CODE stubs on Volta); a HIP build's MMQ instances are
     // the ones Maya's prompt path multiplies Flash's experts with (mmq::supported, which the caller checks first)
     (void) type;
@@ -288,7 +288,7 @@ bool gemm(const Io& io, const WSlot& w, int N, int K, const float* X32, const ui
             strata::kernels::glmb::bf16_to_f16((const uint16_t*) w.q + (size_t) r0 * K, io.w16, (int64_t) n * K, io.s);
         else
             dequant16(w.type, w.q, r0, n, K, io.w16, io.s);
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         // HIP (S7): hipBLASLt with its tuning tables' row for the shape (glm_prefill.cu hands the prompt path's GEMM
         // over when a table is set; a shape without a row runs plain hipBLAS inside it) - plain hipBLAS here for a
         // strided X or a scaled product
@@ -322,7 +322,7 @@ Keep keep_of(const Io& io, const glmd::PromptTiling& t) {
     k.idx_inv = b.take<float>((size_t) std::max(1, g.idx_rope / 2));
     return k;
 }
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // HIP: the tables' host source is pinned and written once per geometry.  A copy from pageable memory makes HIP stage
 // it (a host wait per copy, two a layer), and Windows' HIP runtime submits queued work only when the host waits, so a
 // copy may read its source late: this one never changes once written.  (Never freed: a few hundred bytes a geometry.)
@@ -352,7 +352,7 @@ const float* rope_host(const Glm5Geometry& g, size_t n) {
 
 void upload_rope(const Io& io, const Keep& k) {
     const Glm5Geometry& g = *io.g;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     const float* h = rope_host(g, (size_t) std::max(1, g.qk_rope / 2) + (size_t) std::max(1, g.idx_rope / 2));
     cudaMemcpyAsync(k.inv, h, (size_t) std::max(1, g.qk_rope / 2) * 4, cudaMemcpyHostToDevice, io.s);
     cudaMemcpyAsync(k.idx_inv, h + std::max(1, g.qk_rope / 2), (size_t) std::max(1, g.idx_rope / 2) * 4,
@@ -572,7 +572,7 @@ bool dsa_layer(const Io& io, int il, std::string& err) {
                          il, H, KV, R, (((uintptr_t) lat | (uintptr_t) k_pe) & 15u) == 0 ? "yes" : "no");
         }
     }
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // RDNA 3 / 3.5 / 4: the WMMA kernel (S7).  Every HIP kernel gathers from 2049 keys on, as the 64-head one: a tile
     // costs the same whichever cells fill it, and the gather walk's are the row's selection packed - never more tiles
     // than the dense-masked walk's (Radeon 8065S, 2,048 queries: RDNA 66-79 ms at any context against 75-898 dense-

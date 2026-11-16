@@ -71,7 +71,7 @@ constexpr int kInjRows = 64;    // context positions an injection batch carries
 constexpr int kHeadDim = 128;   // the attention / rope kernels' head size
 
 __device__ __forceinline__ float warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
@@ -254,7 +254,7 @@ __global__ void attn_kernel(const float* __restrict__ Q, const __half* __restric
 constexpr int kAttnQ = 32, kAttnKeys = 16, kAttnSplits = 32, kAttnPart = kHeadDim + 2;
 
 __device__ __forceinline__ float half_warp_max(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x4e, 0xf, 0xf, false)));
@@ -268,7 +268,7 @@ __device__ __forceinline__ float half_warp_max(float v) {
 }
 
 __device__ __forceinline__ float half_warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x4e, 0xf, 0xf, false));

@@ -6,7 +6,7 @@
 # two nvcuda::wmma kernels (the fused MLA and the WMMA scorer): the decode policy keeps them off there.
 if(TARGET strata_engine)
   target_sources(strata_engine PRIVATE src/core/glm_dsa_cpu_volta_twin.cpp)
-  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA)
     target_sources(strata_engine PRIVATE src/kernels/cuda/glmd_volta_mla.cu src/kernels/cuda/glmd_volta_idx.cu
                                          src/kernels/cuda/glmd_graph.cu)
   endif()
@@ -27,7 +27,7 @@ if(STRATA_BUILD_TESTS)
 
   # the kernels against glmd::ref_*, the simple glmd kernels and the twins (needs a GPU, exits 77 without one; HIP
   # skips the WMMA kernels' cases)
-  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
     add_executable(glmd_volta_parity tests/glm_dsa/glmd_volta_parity.cu)
     target_link_libraries(glmd_volta_parity PRIVATE strata_engine)
     glm_dsa_hip_links(glmd_volta_parity)
@@ -57,7 +57,7 @@ endif()
 
 # B10.6 / B10.7 on a GPU: gf::mv's new types vs the host dots, the dominant types vs ggml dequant; run as built and
 # with the B10.6 switches (label gpu, skip 77)
-if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine AND TARGET ggml-base)
+if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine AND TARGET ggml-base)
   add_executable(glmd_mv_parity tests/glm_dsa/glmd_mv_parity.cu)
   target_link_libraries(glmd_mv_parity PRIVATE strata_engine ggml-base)
   glm_dsa_hip_links(glmd_mv_parity)
@@ -72,7 +72,7 @@ if(STRATA_BUILD_TESTS)
   add_executable(glmd_graph_cpu_test tests/glm_dsa/glmd_graph_cpu_test.cpp)
   target_include_directories(glmd_graph_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME glmd_graph_cpu_test COMMAND glmd_graph_cpu_test)
-  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
     add_executable(glmd_graph_test tests/glm_dsa/glmd_graph_test.cu)
     target_link_libraries(glmd_graph_test PRIVATE strata_engine)
     glm_dsa_hip_links(glmd_graph_test)

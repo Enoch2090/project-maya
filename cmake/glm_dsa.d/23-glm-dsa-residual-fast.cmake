@@ -20,7 +20,7 @@ if(STRATA_BUILD_TESTS)
 
   # GPU: res_read / res_close / res_embed / res_head vs a host double reference at n_embd 128, 4096, 6144; the
   # q8_1 fallback dequantizer and glmdsa::mv with BF16 / F32 weights against the native path.
-  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
     add_executable(glmd_residual_gpu_test tests/glm_dsa/glmd_residual_gpu_test.cu)
     target_include_directories(glmd_residual_gpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/core
                                ${_strata_gpu_include_directories})

@@ -22,7 +22,7 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME glm_dsa_split_test COMMAND glm_dsa_split_test)
   endif()
 
-  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
     # B5.1: moe_route at 256 x 8 vs the oracle on 10^5 rows, the shared expert's unclamped SwiGLU (needs a GPU).
     add_executable(glm_dsa_router_test tests/glm_dsa/glm_dsa_router_test.cpp)
     target_include_directories(glm_dsa_router_test PRIVATE ${_strata_gpu_include_directories})

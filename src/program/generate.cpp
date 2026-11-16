@@ -5697,7 +5697,7 @@ int main(int argc, char** argv) {
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
         static const strata::core::ModelGeometry draft_geometry{};
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         // an on-demand vision encoder (it runs on the first GPU): a drafter there can lend its experts' VRAM too,
         // when the expert cache alone cannot hold the encoder (nothing drafts while a picture is read)
         {
@@ -6104,7 +6104,7 @@ int main(int argc, char** argv) {
         // MAYA_TEST_CACHE_FAIL=N: the first N opens fail as an out-of-commit cudaMalloc does (tests the retry)
         int fake_fails = std::getenv("MAYA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("MAYA_TEST_CACHE_FAIL")) : 0;
         int failed = 0;
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         // an on-demand vision encoder (serve --vision; the server sets MAYA_GLM_VISION_LEND_MB): the cache is mapped
         // in pieces, so its tail can be given back while a picture is read (HIP: only VRAM that is free is lent)
         if (o.serve && o.vision && vision_lend_need() > 0) xcache.set_lendable(true);

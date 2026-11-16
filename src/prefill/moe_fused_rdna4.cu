@@ -429,7 +429,11 @@ __device__ __forceinline__ nw_i8 nw_wmma(nw_ab a, nw_ab b, nw_i8 c) {
 #elif STRATA_NAT_W12
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
 #else
+    #if defined(STRATA_USE_MUSA)
+        __trap();   // (MUSA cannot select the abort call that __builtin_trap lowers to)
+    #else
     __builtin_trap();
+    #endif
     return c;
 #endif
 }
@@ -681,7 +685,11 @@ native_kernel(const uint8_t* wbase, size_t stride, int ntiles, const int2* tiles
         }
     }
 #else
+    #if defined(STRATA_USE_MUSA)
+        __trap();   // (MUSA cannot select the abort call that __builtin_trap lowers to)
+    #else
     __builtin_trap();
+    #endif
 #endif
 }
 #endif  // __HIPCC__

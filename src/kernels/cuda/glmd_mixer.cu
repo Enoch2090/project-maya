@@ -149,7 +149,7 @@ bool iota(int* cells, int n, void* stream) {
 // decode_policy_built, keeps them off there, and a policy that asks for them anyway gets the portable kernel,
 // idx_score / mla2)
 bool decode_score(const DecodePolicy& pol, const IdxScore& a, int64_t p, void* stream) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     (void) pol;
     (void) p;
     return idx_score(a, stream);
@@ -176,7 +176,7 @@ bool decode_topk(const DecodePolicy& pol, const float* score, int ld, int n_kv, 
 }
 
 bool decode_mla(const DecodePolicy& pol, const Mla2& a, void* stream) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     (void) pol;
 #else
     if (use_fused_mla(pol, a.n_head, a.qk_nope, a.qk_rope, a.kv_lora, a.v_head, a.w_type))

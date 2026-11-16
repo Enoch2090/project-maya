@@ -49,7 +49,7 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME glm_dsa_prefill_stream_test COMMAND glm_dsa_prefill_stream_test)
   endif()
 
-  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
     # GPU: the rollback checks on the device decode kernels (MID geometry, FP16 / INT8 latents).
     add_executable(glm_dsa_spec_gpu_test tests/glm_dsa/glm_dsa_spec_gpu_test.cu)
     target_include_directories(glm_dsa_spec_gpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/core

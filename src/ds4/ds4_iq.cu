@@ -4,9 +4,9 @@
 #include "ds4_iq1_codes.hpp"
 #include "ds4_par_exp.h"
 #include "ds4_pdl.cuh"
-#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)   // (#354; maya-mm3 builds ds4_iq.cu without it)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && !defined(MAYA_DS4_IQ_ONLY)   // (#354; maya-mm3 builds ds4_iq.cu without it)
 #include "strata/prefill/moe_mmq.hpp"
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include "strata/prefill/moe_fused_rdna4.hpp"
 #endif
 #include <cstring>
@@ -15,12 +15,12 @@
 #endif
 
 #include <cuda_fp16.h>
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include <mma.h>
 #endif
 // rocWMMA (the prompt sets on RDNA 3 / 4's matrix cores) as glm_batch.cu reads it: a device pass for gfx11 / gfx12
 // only, the host pass when the build targets such a card (STRATA_HAS_WMMA)
-#if defined(STRATA_USE_HIP) && \
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && \
     ((!(defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && STRATA_HAS_WMMA) || \
      ((defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && (defined(__gfx1100__) || defined(__gfx1101__) || \
       defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__))))
@@ -121,7 +121,7 @@ __device__ __forceinline__ void load_tab(uint32_t* tab) {
 // there every rounding is explicit (no contraction, barriers the compiler cannot fold through) and IQ4_XS's rows load
 // in 16-bit halves.  Elsewhere - gfx11 and the other AMD GPUs, CUDA - the kernels compile as before (the same bits and
 // speed as v1.1.30: the barriers cost a Strix Halo ~7% of its decode).
-#if defined(STRATA_USE_HIP) && defined(__clang__) && (defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx906__))
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__clang__) && (defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx906__))
 #define DS4_IQ_STRICT_FP 1
 #else
 #define DS4_IQ_STRICT_FP 0
@@ -640,7 +640,7 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
     }
 }
 
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
 __device__ __forceinline__ float hip_xor16(float v) {
     return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
 }
@@ -659,7 +659,7 @@ __device__ __forceinline__ float hip_xor1(float v) {
 #endif
 
 __device__ __forceinline__ float warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
 #if DS4_IQ_STRICT_FP
     v = fadd_no_fma(v, hip_xor16(v));
     v = fadd_no_fma(v, hip_xor8(v));
@@ -732,7 +732,7 @@ __device__ __forceinline__ bool group(const Args& a, int grp, const uint8_t*& bl
 // RW rows a warp, 32 / RW lanes a row (a lane a sub-block a step), their sums over those lanes
 template <int RW>
 __device__ __forceinline__ float lanes_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
 #if DS4_IQ_STRICT_FP
     if constexpr (RW <= 1) v = fadd_no_fma(v, hip_xor16(v));
     if constexpr (RW <= 2) v = fadd_no_fma(v, hip_xor8(v));
@@ -786,7 +786,7 @@ struct Ahead {
 // summed in the same order: every output keeps its bits, whatever the grid.  The smaller codebooks keep the full grid (a
 // block there loads little, and one of an empty group leaves at once).  CUDA's maya-ds4 only: HIP and maya-mm3's build
 // of this file (MAYA_DS4_IQ_ONLY) keep the full grids, and so do MiniMax's epilogues (EPI 1..3).
-#if defined(STRATA_USE_HIP) || defined(MAYA_DS4_IQ_ONLY)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || defined(MAYA_DS4_IQ_ONLY)
 #define DS4_IQ_PERSIST_BUILD 0
 #else
 #define DS4_IQ_PERSIST_BUILD 1
@@ -1072,7 +1072,7 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
     }
 }
 
-#if !defined(STRATA_USE_HIP) || STRATA_HAS_WMMA
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || STRATA_HAS_WMMA
 // the same on the tensor cores (sm_70+; AMD: RDNA 3 / 4's, rocWMMA): 8 warps each 16 rows x 32 outputs, the tiles
 // F16 in shared memory.  RM > 1: a block takes RM x 64 rows (each warp RM x 16), every weight tile decoded once for
 // all of them - an expert's weights decoded once per 64 * RM of its rows, not once per 64 (the decode is most of the
@@ -1082,10 +1082,10 @@ template <int T, bool GATE_UP, int EPI = 0, int RM = 1>
 __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
     pdl_wait();
     pdl_trigger();
-#if defined(STRATA_USE_HIP) && !DS4_ROCWMMA
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && !DS4_ROCWMMA
     __builtin_trap();   // (a device pass for a card without WMMA: never launched there - tc_ok)
 #else
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     namespace wm = rocwmma;
     using wh = _Float16;
 #else
@@ -1274,7 +1274,7 @@ __global__ void __launch_bounds__(kThreads) light_q8_kernel(const float* __restr
     const size_t at = (size_t) b * 32 + lane, qr = (size_t) blockIdx.y;
     const float v = xf != nullptr ? xf[(size_t) idx[lr] * ldx + at] : __half2float(__ushort_as_half(xh[(size_t) lr * ldx + at]));
     float am = fabsf(v);
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
     am = fmaxf(am, hip_xor16(am));
     am = fmaxf(am, hip_xor8(am));
     am = fmaxf(am, hip_xor4(am));
@@ -1397,7 +1397,7 @@ __global__ void __launch_bounds__(kThreads) values_kernel(const uint8_t* __restr
 // as ds4_gguf.cu's: sm_70 and later (AMD: RDNA 3 / 4), MAYA_DS4_NO_TC=1 keeps the F32 kernel - per device (the GPUs
 // of a run need not be of one generation: one before sm_70 beside newer ones keeps its F32 kernel)
 bool tc_ok() {
-#if defined(STRATA_USE_HIP) && !STRATA_HAS_WMMA
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && !STRATA_HAS_WMMA
     return false;
 #else
     static const bool off = [] {
@@ -1409,7 +1409,7 @@ bool tc_ok() {
     if (off || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
     int k = known[dev].load(std::memory_order_relaxed);
     if (k == 0) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         cudaDeviceProp p{};
         const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
                         (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || std::strncmp(p.gcnArchName, "gfx12", 5) == 0);
@@ -1459,7 +1459,7 @@ struct Iq1Var {
 };
 // the early loads by default: IQ1_M on AMD (a Radeon 8065S, 6 experts' gate / up: 200 -> 150 us); IQ1_S there and both
 // on the V100 gain nothing from them
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 template <int T>
 constexpr bool kAhead = T == kIQ1_M;
 #else
@@ -1606,7 +1606,7 @@ static int tc_rows_mult() {   // (set_tc_kernel's RM for this device: DS4_IQ_TC_
         return n >= 4 ? 4 : n >= 2 ? 2 : 1;
     }();
     if (env > 0) return env;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     static std::atomic<int> known[64];   // 0: not asked yet, else the answer
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 1;
@@ -1623,7 +1623,7 @@ static int tc_rows_mult() {   // (set_tc_kernel's RM for this device: DS4_IQ_TC_
 }
 template <int T, bool GU, int EPI = 0>
 void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
-#if !defined(STRATA_USE_HIP) || STRATA_HAS_WMMA
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || STRATA_HAS_WMMA
     if (tc_ok()) {
         SetArgs b = a;   // (gate / up: FP16 rows when the caller gave them - set_gate_up's x16)
         b.xh_vec = b.xh != nullptr && ((uintptr_t) b.xh & 15) == 0 && (b.ldx & 7) == 0 ? 1 : 0;
@@ -1856,7 +1856,7 @@ bool persist_on() {
 }
 void set_persist(int on) { g_persist_set.store(on < 0 ? -1 : on != 0 ? 1 : 0, std::memory_order_relaxed); }
 
-#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && !defined(MAYA_DS4_IQ_ONLY)
 // Prompt expert sets through the existing GLM MMQ path (HIP, opt-in).
 // The same q8_1/MMA path the GLM prompt uses (strata::prefill::mmq): the packed expert is read once, activations are
 // rounded to q8_1, and the products run on int8 tensor cores.  Opt-in (MAYA_DS4_EXPERT_MMQ=1), sets of at least 32 rows;
@@ -2147,7 +2147,7 @@ bool mmq_down(const SetArgs& a, cudaStream_t s) {
 
 #endif
 
-#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && !defined(MAYA_DS4_IQ_ONLY)
 // Prompt expert sets through the fused int8 experts the GLM prompt uses (strata::prefill::rdna4, gfx1151 / gfx1100 /
 // RDNA4): the weights decoded to int8 in the WMMA tiles' shared memory, the activations and the SwiGLU's H rounded to
 // int8 per 32 values (as GLM's), the products on the int8 matrix cores.  On by default where it covers the set's formats
@@ -2257,7 +2257,7 @@ bool fused_down(const SetArgs& a, cudaStream_t s) {
 #endif
 
 bool set_gate_up(const SetArgs& a, cudaStream_t s) {
-#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && !defined(MAYA_DS4_IQ_ONLY)
     if (fused_wanted(a)) {
         if (fused_gate_up(a, s)) return true;
         std::fprintf(stderr, "ds4: the fused prompt experts could not run a set\n");
@@ -2304,7 +2304,7 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
 }
 
 bool set_down(const SetArgs& a, cudaStream_t s) {
-#if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && !defined(MAYA_DS4_IQ_ONLY)
     if (fused_wanted(a)) {
         if (fused_down(a, s)) return true;
         std::fprintf(stderr, "ds4: the fused prompt experts could not run a set's down\n");

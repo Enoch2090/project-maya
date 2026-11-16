@@ -20,7 +20,7 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME glm_state_layout_test COMMAND glm_state_layout_test)
   endif()
   # GPU: a descriptor-laid arena's slot runs round-trip through the host (skips with 77 without a device).
-  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
     add_executable(glm_state_slot_gpu_test tests/glm_dsa/glm_state_slot_gpu_test.cpp)
     target_include_directories(glm_state_slot_gpu_test PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(glm_state_slot_gpu_test PRIVATE strata_engine)

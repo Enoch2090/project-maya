@@ -4,7 +4,7 @@
 # Maya-owned glm_fast_path.cu (fast_dsa) and glm_prefill.cu (prefill) dispatch into these on every backend, so an
 # engine without a GPU backend gets the refusing stub instead of a link error.  CUDA and HIP get the real mixer.
 if(TARGET strata_engine)
-  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA)
     target_sources(strata_engine PRIVATE src/core/glm_dsa_mixer.cu src/kernels/cuda/glmd_mixer.cu)
   else()
     target_sources(strata_engine PRIVATE src/core/glm_dsa_mixer_stub.cpp)
@@ -21,7 +21,7 @@ if(STRATA_BUILD_TESTS)
                              ${CMAKE_CURRENT_SOURCE_DIR}/src/core)
   add_test(NAME glm_dsa_mixer_cpu_test COMMAND glm_dsa_mixer_cpu_test)
 
-  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
     # B4.7 kernel parity (GPU): the same orchestration on the device kernels vs the twins and the reference, the
     # named wrong readings, idx_score vs Maya's dsa_score, mla2's device count, and the B14.4 graph replay test.
     add_executable(glmd_kernel_parity tests/glm_dsa/glmd_kernel_parity.cu)

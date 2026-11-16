@@ -267,7 +267,7 @@ struct Draft::Impl {
             !vec(pk, DP + "confidence_head.proj.weight", 0.0f, cw, (size_t) D + R, err) ||
             !vec(pk, DP + "confidence_head.proj.bias", 0.0f, cb, 1, err))
             return false;
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         {   // (fc in FP16 where BF16 has no tensor cores; MAYA_MM3_DSPARK_FC16=0 keeps BF16 everywhere)
             cudaDeviceProp pr{};
             const char* fv = std::getenv("MAYA_MM3_DSPARK_FC16");

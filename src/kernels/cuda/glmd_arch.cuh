@@ -23,7 +23,7 @@
 #endif
 #endif
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #define GLMD_WMMA 0
 #elif !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 #define GLMD_WMMA 1

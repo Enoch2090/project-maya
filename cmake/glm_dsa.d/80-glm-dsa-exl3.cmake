@@ -8,7 +8,7 @@
 #         expert kernels instead of the matrix-core ones (gfx11's default)
 #   both  MAYA_FORCE_AVX2=1: the CPU lane's AVX2 tier on an AVX-512 CPU, for the calls that take the lane's tier
 #         (no GPU used)
-if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_kernels AND
+if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_kernels AND
    TARGET strata_kernels_cpu)
   enable_testing()
   add_executable(glm_dsa_exl3_test tests/glm_dsa/glm_dsa_exl3_test.cu)

@@ -93,7 +93,7 @@ bool Glm5Model::mtp_decode_wanted(int dev, int n_parts, bool dsa) {
     // the helper's experts read in place its decode is faster with MTP (GLM-5.3-Flash +15..18 %, GLM-5.3 744B as well)
     if (hlink::wanted()) return n_parts == 1;
     if (n_parts != 1 || dsa) return false;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // the Strix / Gorgon Halo APUs (gfx1150 / gfx1151 / gfx1152): their memory holds every expert
     hipDeviceProp_t prop{};
     if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;

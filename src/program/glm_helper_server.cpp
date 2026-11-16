@@ -183,7 +183,7 @@ int main(int argc, char** argv) {
     hl::Ctl* c = (hl::Ctl*) cp;
     const char* dv = std::getenv("MAYA_GLM_HELPER_DEVICE");
     const int dev = dv != nullptr ? std::atoi(dv) : 0;
-#ifdef STRATA_USE_HIP
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // MAYA_GLM_HELPER_SPIN=1: spin in each call's stream wait instead of blocking - measured no faster (GLM-5.3-Flash
     // decode 34.8/32.5 tok/s blocking vs 34.7-34.8/31.2-32.6 spinning, a Radeon 8065S helper), and a spinning core
     // heats the APU the GPU shares, so it is off unless asked

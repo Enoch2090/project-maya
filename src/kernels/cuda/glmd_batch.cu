@@ -295,7 +295,7 @@ constexpr size_t kKeyBytes = (size_t) 8 * kN * 16 * 2;   // 32,768
 constexpr size_t kQBytes = (size_t) 8 * kQ * 16 * 2;     // 16,384 a buffer
 constexpr size_t smem_bytes(int H) { return kKeyBytes + 2 * kQBytes + 2 * (size_t) kQ * 4 + (size_t) kQ * H * 4; }
 }  // namespace sw
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 namespace sw {
 constexpr int kThreads = 256;
 }  // namespace sw
@@ -856,7 +856,7 @@ constexpr size_t smem_bytes(int R) {
 }  // namespace h64
 static_assert(h64::smem_bytes(64) == kMlaH64Smem, "the header's constant is the H64 kernel's dynamic shared memory");
 static_assert(h64::smem_bytes(64) + 64 <= 98304, "V100: at most 96 KB of shared memory per block (opt-in)");
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 namespace h64 {
 constexpr int kThreads = 256;
 #if GLMD_WMMA
@@ -1157,7 +1157,7 @@ __global__ void __launch_bounds__(h64::kThreads, 1) mla_prompt_h64_kernel(const 
 }
 #endif  // !STRATA_USE_HIP (the H64 kernel)
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // ---- RDNA 3 / 3.5 / 4 (gfx11 / gfx12, wave32 WMMA): B9.5's arithmetic - Q in FP16 with the scale folded in and the
 // B15.1 guard, the cells in FP16, F32 accumulation, the online softmax in F32, P in FP16 - within RDNA's 64 KiB of LDS
 // a workgroup (the CUDA kernels take 89-97 KB).  A block per (16 heads, query row), the four head blocks of a row next
@@ -1195,7 +1195,11 @@ __device__ __forceinline__ f8 wmma(h16 a, h16 b, f8 c) {
 #elif GLMD_RDNA_WMMA
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 #else
+    #if defined(STRATA_USE_MUSA)
+        __trap();   // (MUSA cannot select the abort call that __builtin_trap lowers to)
+    #else
     __builtin_trap();
+    #endif
     return c;
 #endif
 }
@@ -1223,7 +1227,11 @@ __device__ __forceinline__ uint4 lat_h8(const void* lat, int lat_q8, int kv_lora
 template <int R>
 __global__ void __launch_bounds__(256) mla_prompt_rdna_kernel(const STRATA_GRID_CONSTANT MlaPrompt a) {
 #if !GLMD_RDNA_WMMA
+    #if defined(STRATA_USE_MUSA)
+        __trap();   // (MUSA cannot select the abort call that __builtin_trap lowers to)
+    #else
     __builtin_trap();   // (no WMMA on this pass: never launched, mla_prompt_rdna_ok() refuses the device)
+    #endif
 #else
     constexpr int K = 512, CH = 16, HB = 16, RW = R > 0 ? R : 16;
     constexpr int NKB = R > 0 ? 5 : 4;   // a wave's k-blocks: four latent ones, then its rope one (waves 0-3)
@@ -1385,7 +1393,11 @@ __global__ void __launch_bounds__(256) index_score_rdna_kernel(const float* __re
                                                                const void* __restrict__ keys, int H, int T, int64_t k0,
                                                                int nk, float* __restrict__ score, int64_t ld) {
 #if !GLMD_RDNA_WMMA
+    #if defined(STRATA_USE_MUSA)
+        __trap();   // (MUSA cannot select the abort call that __builtin_trap lowers to)
+    #else
     __builtin_trap();   // (no WMMA on this pass: never launched, index_score_wmma_fits refuses the device)
+    #endif
 #else
     __shared__ __align__(32) _Float16 sKey[8][kRsN][16];
     __shared__ __align__(32) _Float16 sQ[8][kRsQ][16];
@@ -1653,7 +1665,7 @@ bool index_score_tile_keys(const float* iq, const float* w, const void* keys, in
 }
 
 // the WMMA scorer's opt-in, once per device and key dtype
-#ifndef STRATA_USE_HIP
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 template <bool KF16>
 static bool sw_attr_ok(size_t need) {
     int dev = 0;
@@ -1682,13 +1694,13 @@ template <bool KF16>
 static bool sw_attr_ok(size_t) { return false; }
 #endif
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 bool rdna_wmma_device();   // (below: the RDNA kernels' devices)
 #endif
 
 bool index_score_wmma_fits(int key_f16, int idx_heads, int idx_dim) {
     if (idx_dim != sw::kD || idx_heads <= 0 || idx_heads > 64) return false;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // HIP: the RDNA scorer (index_score_rdna_kernel, S7) on gfx11 / gfx12, up to 32 heads (its LDS holds 64 x 32 weights)
     (void) key_f16;
     return idx_heads <= kRsMaxH && rdna_wmma_device();
@@ -1703,7 +1715,7 @@ bool index_score_tile_wmma(const float* iq, const float* w, const void* keys, in
     if (!index_score_wmma_fits(key_f16, idx_heads, idx_dim) || ld < nk || k0 < 0 || !iq || !w || !keys || !score ||
         ((uintptr_t) iq & 15u) || ((uintptr_t) keys & 15u) || (T + sw::kQ - 1) / sw::kQ > 65535)
         return refuse("index_score_tile_wmma");
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     const dim3 grid((unsigned) ((nk + sw::kN - 1) / sw::kN), (unsigned) ((T + sw::kQ - 1) / sw::kQ));
     const size_t smem = sw::smem_bytes(idx_heads);
     if (key_f16)
@@ -1764,7 +1776,7 @@ bool mla_prompt_f32(const MlaPrompt& a, void* stream) {
 }
 
 // the opt-in and the attribute check, once per device (R6: a missing cudaFuncSetAttribute is a silent no-attention bug)
-#ifndef STRATA_USE_HIP   // the WMMA kernel is CUDA's (HIP: never ok, the F32 kernel runs); keeps check_hip_compat exact
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))   // the WMMA kernel is CUDA's (HIP: never ok, the F32 kernel runs); keeps check_hip_compat exact
 template <int R>
 static bool wmma_attr_ok() {
     int dev = 0;
@@ -1802,7 +1814,7 @@ bool mla_prompt_wmma(const MlaPrompt& a, void* stream) {
     if (!mla_args_ok(a, 512) || a.kv_lora != kWmK) return refuse("mla_prompt_wmma");
     const bool ok = a.qk_rope == 64 ? wmma_attr_ok<64>() : wmma_attr_ok<0>();
     if (!ok) return false;
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     const dim3 grid((unsigned) a.T, (unsigned) (a.n_head / kWmH));
     if (a.qk_rope == 64)
         mla_prompt_wmma_kernel<64><<<grid, 256, kWmSmem, (cudaStream_t) stream>>>(a);
@@ -1815,7 +1827,7 @@ bool mla_prompt_wmma(const MlaPrompt& a, void* stream) {
 }
 
 // the H64 kernel's opt-in, once per device and instance (as wmma_attr_ok)
-#ifndef STRATA_USE_HIP
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 template <int R, bool LQ8>
 static bool h64_attr_ok() {
     int dev = 0;
@@ -1859,7 +1871,7 @@ bool mla_prompt_h64_fits(const MlaPrompt& a) {
 bool mla_prompt_h64(const MlaPrompt& a, void* stream) {
     if (a.T <= 0) return true;
     if (!mla_prompt_h64_fits(a)) return refuse("mla_prompt_h64");
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     const dim3 grid((unsigned) a.T, (unsigned) (a.n_head / h64::kH));
     const cudaStream_t s = (cudaStream_t) stream;
     if (a.qk_rope == 64) {
@@ -1880,7 +1892,7 @@ bool mla_prompt_h64(const MlaPrompt& a, void* stream) {
 #endif
 }
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // the RDNA WMMA kernels' devices: the gfx11 / gfx12 archs whose device pass has their bodies (GLMD_RDNA_WMMA's list),
 // once per device
 bool rdna_wmma_device() {

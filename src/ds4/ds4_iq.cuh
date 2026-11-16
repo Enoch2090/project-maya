@@ -103,7 +103,7 @@ struct SetArgs {
     int tu = 0;                // (kActOai) the up's type when it is not the gate's (0: tg) - two passes, as Args::tu
     float* graw = nullptr;     // ... the gate's F32 sums between them: [local rows][n_ff] (the caller's scratch)
 };
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // Host metadata for a prompt set, valid only within this scope; nested calls restore their caller's metadata.
 // Keeping it here leaves the shared EXL3/GGUF SetArgs ABI unchanged.
 class MmqRowsScope {

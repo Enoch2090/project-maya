@@ -19,7 +19,7 @@ constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
 constexpr int S = 128, HK = 16, HV = 48, C = 10240;
 
 __device__ __forceinline__ float warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
@@ -33,7 +33,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 #endif
 }
 __device__ __forceinline__ float warp_max(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f)));

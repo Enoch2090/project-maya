@@ -3,7 +3,7 @@
 # and join it on any backend.
 if(TARGET strata_engine)
   target_sources(strata_engine PRIVATE src/core/glm_dsa_cpu_fast_twin.cpp)
-  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA)
     target_sources(strata_engine PRIVATE src/kernels/cuda/glmd_fast.cu)
   endif()
 endif()
@@ -16,7 +16,7 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME glmd_fast_cpu_test COMMAND glmd_fast_cpu_test)
 
   # The kernels against glmd::ref_* and the twins (needs a GPU, exits 77 without one).
-  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
     add_executable(glmd_fast_parity tests/glm_dsa/glmd_fast_parity.cu)
     target_link_libraries(glmd_fast_parity PRIVATE strata_engine)
     glm_dsa_hip_links(glmd_fast_parity)

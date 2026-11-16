@@ -363,7 +363,7 @@ DsaLeft dsa_left() {
     DsaLeft l;
     l.all = generic;
     l.k_quants = (ext_mv_cfg() & 2) != 0;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     l.q6_k = l.floats = true;
 #else
     l.q6_k = p100_mv_mode() > 0;
@@ -376,7 +376,7 @@ DsaLeft dsa_left() {
 // either way) and mv_dsa's launches came within 0-3% of mv()'s; Pascal is not measured.  MAYA_GLMD_MV_DSA=1 runs
 // mv_dsa on any device.  Once per device.
 bool dsa_auto_device() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return false;
 #else
     static int cache[64];   // 0 unknown, 1 on, 2 off

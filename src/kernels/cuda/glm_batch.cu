@@ -4,7 +4,7 @@
 // (same operation order where the order is observable), so a prompt read in chunks leaves the state the token path
 // would have left up to float rounding - the projections around them (FP16 tensor-core GEMMs instead of q8_1 dot
 // products) are where the two paths really differ, as llama.cpp's batched and one-token paths do.
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // rocWMMA (the f16q prompt attention) knows gfx11 and gfx12 only: its config.hpp stops a device pass for any other
 // architecture (RDNA 2, gfx1030) with a static_assert, so that pass leaves it out and compiles the f16q kernel empty -
 // a GPU without WMMA never takes f16q (glm_prefill.cu's mla_attn_path).  The host pass reads it only when the build
@@ -41,7 +41,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include <mma.h>
 #endif
 
@@ -57,7 +57,7 @@ namespace strata::kernels::glmb {
 namespace {
 
 __device__ __forceinline__ float warp_sum(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
     v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
@@ -71,7 +71,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 #endif
 }
 __device__ __forceinline__ float warp_max(float v) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f)));
     v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f)));
@@ -807,7 +807,7 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
     }
 }
 
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // The same attention on the tensor cores (sm_70+): block = (token, 16 heads), 8 warps.  The token's cells are walked
 // in chunks of 32: their latent rows go to FP16 in shared memory, the scores S = Q16 . L^T come from the tensor cores
 // (two 16-cell tiles, the K = 512 split in four quarters across the warps and summed), the softmax is the online one
@@ -1649,7 +1649,7 @@ __global__ void __launch_bounds__(256) mla_attn_mma_kernel(const float* __restri
 }
 #endif
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // mla_attn_tc_kernel on RDNA3 WMMA (rocWMMA).  RDNA allows 64 KiB of LDS a workgroup, the CUDA kernel takes 91,
 // so Q (FP16, from the q_abs product) stays in registers - each warp holds its 64-wide K slice of the 16 heads as four
 // A fragments - and the cells go in chunks of 16: O 32 KiB (F32) + L 16 KiB + score partials 8 KiB + P 0.5 KiB.
@@ -1663,7 +1663,11 @@ __global__ void __launch_bounds__(256) mla_attn_wmma_kernel(const _Float16* __re
                                                             const int* __restrict__ n_sel_arr, int n_sel_max,
                                                             int n_head, float scale, float* __restrict__ ctx, bool q8) {
 #if !STRATA_ROCWMMA
+    #if defined(STRATA_USE_MUSA)
+        __trap();   // (MUSA cannot select the abort call that __builtin_trap lowers to)
+    #else
     __builtin_trap();   // (a device pass without rocWMMA: never launched there)
+    #endif
 #else
     namespace wm = rocwmma;
     constexpr int KV = 512;
@@ -1783,7 +1787,11 @@ __device__ __forceinline__ mla2_f8 mla2_wmma(mla2_h16 a, mla2_h16 b, mla2_f8 c) 
     for (int i = 0; i < 8; ++i) { aa[i] = a[k0 + i]; bb[i] = b[k0 + i]; }
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(aa, bb, c);
 #else
+    #if defined(STRATA_USE_MUSA)
+        __trap();   // (MUSA cannot select the abort call that __builtin_trap lowers to)
+    #else
     __builtin_trap();
+    #endif
     return c;
 #endif
 }
@@ -1894,7 +1902,11 @@ __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             // Keep all matrix lanes live before the output mask/normalization.
+#if defined(STRATA_USE_MUSA)
+            (void) acc[nt][i];   // (no vector constraint here: the value stays live either way)
+#else
             asm volatile("" :: "v"(acc[nt][i]));
+#endif
             const int r = mla2_wmma_row(i, hi);
             const float inv = denom[r] > 0 ? 1 / denom[r] : 0;
             ctx[((size_t)t * n_head + h0 + r) * 512 + wave * 64 + nt * 16 + l16] = acc[nt][i] * inv;
@@ -2324,7 +2336,7 @@ void dsa_pool(const float* ik_cache, const float* ig_cache, const float* ape, fl
     check("dsa_pool");
 }
 
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // The tiled kernel's scores on the FP16 tensor cores (the default on CUDA; MAYA_GLM_DSA_SCORE=2 as well): the same tile - 4 tokens' 128 (token,
 // head) query rows against 64 pools, the whole 128-long k in shared memory as FP16 - eight warps of 16 rows x 64 pools
 // (four m16n16k16 accumulators), FP32 sums; the epilogue as the tiled one's (relu(dot) * w over the 32 heads, FP32).
@@ -2403,7 +2415,7 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
         const char* v = getenv("MAYA_GLM_DSA_SCORE");
         return v == nullptr || std::atoi(v) != 0;
     }();
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // (the default on CUDA; MAYA_GLM_DSA_SCORE=1: the FP32 tiled kernel, 0: the warp kernel) - 27K prompt dsa_index
     // 826 / 826 -> 495 / 495 ms, prompt 36.9 / 37.0 -> 36.6 / 36.6 s, the needle answered
     static const bool tc = getenv("MAYA_GLM_DSA_SCORE") == nullptr || std::atoi(getenv("MAYA_GLM_DSA_SCORE")) == 2;
@@ -2452,7 +2464,7 @@ void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_poo
 
 bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
                     float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     (void) q_abs, (void) lat, (void) cells, (void) n_sel, (void) n_head, (void) kv_lora, (void) scale, (void) ctx;
     (void) part, (void) part_cap, (void) s, (void) lat_q8;
     return false;   // (Volta only)
@@ -2509,7 +2521,7 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
         return;
     }
     const dim3 grid((unsigned) T, (unsigned) (n_head / MB_HG));
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // per device, the prompt attention kernel: 0 not chosen yet, 1 tensor cores with O in shared memory (91 KB: Volta,
     // and Ampere+ with MAYA_GLM_PREFILL_ATTN=wmma), 2 tensor cores with O in registers (58 KB: Turing, sm_75 - its
     // rescale assumes the sm_75+ fragment layout), 3 mma.sync, 32 heads a block (Ampere and newer), -1 the F32 kernel
@@ -2627,7 +2639,7 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
     check("mla_attn");
 }
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 void mla_attn_f16q(const uint16_t* q16, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
                    int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8) {
     if (T <= 0) return;

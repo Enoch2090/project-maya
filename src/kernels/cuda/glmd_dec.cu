@@ -268,7 +268,7 @@ struct DevCfg {
 // other AMD arch until someone measures it there (it builds and fits on all of them: 55 KB of LDS a block).
 // MAYA_GLMD_MLA_DEC=1 takes it on any device it fits; =0 keeps mla2's kernels everywhere (decode_mla's legacy_attn).
 bool auto_device(int dev) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     hipDeviceProp_t prop{};
     if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;
     return std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;

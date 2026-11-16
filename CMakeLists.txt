@@ -66,12 +66,21 @@ endif()
 
 option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
 option(STRATA_ENABLE_HIP "Build the HIP targets for gfx1100 wave32 hardware" OFF)
+option(STRATA_ENABLE_MUSA "Build the MUSA targets (Moore Threads GPUs)" OFF)
+# EXL3 (exllamav3) quants' kernels.  cmake/musa_backend.cmake swaps this for a stub on MUSA: mcc's device
+# codegen does not finish on exl3.cu (30+ minutes, no output), and the GLM-5.3-Flash GGUFs do not carry EXL3
+# weights.  Nothing selects them at run time, so the stub only has to satisfy the linker.
+set(STRATA_EXL3_IMPL "src/kernels/cuda/exl3.cu" CACHE STRING "EXL3 kernel implementation source")
 option(STRATA_PREFILL_MMQ "Build the GGML MMQ prompt path for HIP (a HIP build needs it)" OFF)
-if(STRATA_PREFILL_MMQ AND NOT STRATA_ENABLE_HIP)
-  message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_ENABLE_HIP=ON")
+if(STRATA_PREFILL_MMQ AND NOT (STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA))
+  message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_ENABLE_HIP=ON or STRATA_ENABLE_MUSA=ON")
 endif()
 # the GLM prompt path (src/core/glm_prefill.cu, always in strata_engine) multiplies its experts with MMQ, so a HIP
 # build without it does not link (found by @boxwrench in #17)
+if(STRATA_ENABLE_MUSA AND NOT STRATA_PREFILL_MMQ)
+  message(FATAL_ERROR "A MUSA build needs -DSTRATA_PREFILL_MMQ=ON: the GLM prompt path multiplies its experts "
+                      "with MMQ (cmake/musa_backend.cmake is passed it by the build command)")
+endif()
 if(STRATA_ENABLE_HIP AND NOT STRATA_PREFILL_MMQ)
   message(FATAL_ERROR "A HIP build needs -DSTRATA_PREFILL_MMQ=ON: the GLM prompt path multiplies its experts with "
                       "MMQ (./maya.sh --backend hip sets it)")
@@ -79,8 +88,16 @@ endif()
 if(STRATA_ENABLE_CUDA AND STRATA_ENABLE_HIP)
   message(FATAL_ERROR "STRATA_ENABLE_CUDA and STRATA_ENABLE_HIP are separate backends; enable only one")
 endif()
+if(STRATA_ENABLE_CUDA AND STRATA_ENABLE_MUSA)
+  message(FATAL_ERROR "STRATA_ENABLE_CUDA and STRATA_ENABLE_MUSA are separate backends; enable only one")
+endif()
+if(STRATA_ENABLE_HIP AND STRATA_ENABLE_MUSA)
+  message(FATAL_ERROR "STRATA_ENABLE_HIP and STRATA_ENABLE_MUSA are separate backends; enable only one")
+endif()
 if(STRATA_ENABLE_HIP)
   include(cmake/hip_backend.cmake)
+elseif(STRATA_ENABLE_MUSA)
+  include(cmake/musa_backend.cmake)
 endif()
 # The test suite and the micro benchmarks live in tests/ and bench/micro/, which the published source leaves out.
 set(_strata_tests_default OFF)
@@ -372,7 +389,7 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
-if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -460,7 +477,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/cuda/glm_fast.cu
                           src/kernels/cuda/glm_batch.cu
-                          src/kernels/cuda/exl3.cu
+                          ${STRATA_EXL3_IMPL}
                           src/kernels/cuda/exl3_legacy.cu
                           src/kernels/cuda/glm_kv_stream.cu
                           src/kernels/ngram.cpp
@@ -1647,7 +1664,47 @@ if(STRATA_NATIVE_EXPERTS)
       add_test(NAME glm_mmq_glu_test COMMAND glm_mmq_glu_test)
       set_tests_properties(glm_mmq_glu_test PROPERTIES TIMEOUT 300)
     endif()
-  elseif(STRATA_PREFILL_MMQ)
+  elseif(STRATA_PREFILL_MMQ AND STRATA_ENABLE_MUSA)
+    # The GLM prompt path multiplies its experts with ggml's MMQ kernels (src/core/glm_prefill.cu asks
+    # mmq::built()).  MUSA compiles the same pinned sources through mcc: ggml-cuda's mma/PTX branches do not
+    # participate (__CUDA_ARCH__ is undefined under `-x musa`), so the instance falls back to its portable
+    # vec_dot, and probe work on this hardware confirmed the host and device MMQ configs agree.  No
+    # moe_fused_rdna4.cu here: that is AMD wave32 assembly.
+    if(STRATA_GGML_DIR)
+      set(_strata_gg "${STRATA_GGML_DIR}/ggml")
+    else()
+      set(_strata_gg "${strata_llamacpp_SOURCE_DIR}/ggml")
+    endif()
+    set(_strata_mmq "${_strata_gg}/src/ggml-cuda")
+    if(NOT EXISTS "${_strata_mmq}/common.cuh" OR NOT EXISTS "${_strata_mmq}/quantize.cu")
+      message(FATAL_ERROR "The selected GGML source is missing the ggml-cuda MMQ sources: ${_strata_mmq}")
+    endif()
+    set(_strata_mmq_sources
+      src/prefill/moe_mmq.cu
+      src/prefill/ggml_cuda_host.cu
+      "${_strata_mmq}/quantize.cu"
+      "${_strata_mmq}/convert.cu")
+    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k q5_0)
+      list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
+    endforeach()
+    # The instance sources live outside this project tree, so cmake/musa_backend.cmake's sweep does not
+    # reach them: give them the same MUSA compile rule here.
+    foreach(_src IN LISTS _strata_mmq_sources)
+      # LANGUAGE CXX too: without a language CMake files a .cu under HEADER_FILE_ONLY and silently drops it
+      # from the target (which leaves the MMQ instances out and the link short of mul_mat_q_case).
+      set_source_files_properties("${_src}" PROPERTIES LANGUAGE CXX
+        COMPILE_OPTIONS "-x;musa;${STRATA_MUSA_ARCH_FLAGS};-O3;-include;${CMAKE_CURRENT_SOURCE_DIR}/include/strata/musa_compat/ggml_dp4a_arch.h")
+    endforeach()
+    add_library(strata_mmq STATIC ${_strata_mmq_sources})
+    target_include_directories(strata_mmq
+      PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
+      PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(strata_mmq PRIVATE GGML_USE_MUSA=1)
+    target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    target_link_libraries(strata_prefill PUBLIC strata_mmq)
+    target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
+    target_link_libraries(strata_engine PUBLIC strata_mmq ${_strata_gpu_blas_target})
+  elseif(STRATA_PREFILL_MMQ AND STRATA_ENABLE_HIP)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses
     # common.cuh's native HIP path without enabling a second GGML HIP backend.
     if(STRATA_GGML_DIR)
@@ -1670,6 +1727,7 @@ if(STRATA_NATIVE_EXPERTS)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
+    message(STATUS "MUSA MMQ sources: ${_strata_mmq_sources}")
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
     target_include_directories(strata_mmq
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"

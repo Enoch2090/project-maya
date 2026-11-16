@@ -20,7 +20,7 @@ namespace strata::kernels::glmb {
 __device__ __forceinline__ const uint8_t* lat8_rec(const uint16_t* lat, int kv, int cell) {
     return (const uint8_t*) lat + (size_t) (kv + kv / 16) * cell;
 }
-#if defined(STRATA_USE_HIP) && !defined(__gfx942__) && !defined(__gfx950__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && !defined(__gfx942__) && !defined(__gfx950__)
 #define STRATA_LAT8_UNSIGNED_ZEROS 1
 // two FP16 values, a zero without its sign
 __device__ __forceinline__ unsigned lat8_unsigned_zeros(unsigned x) {
@@ -65,7 +65,7 @@ __device__ __forceinline__ bool lat8_normal(__half d) { return (__half_as_ushort
 __device__ __forceinline__ uint2 lat8_h4(const uint8_t* rec, int kv, int c4) {
     const uint32_t w = ((const uint32_t*) rec)[c4];
     const __half d = ((const __half*) (rec + kv))[(4 * c4) >> 5];
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (!lat8_normal(d)) return lat8_q4_f32(w, __half2float(d));
 #endif
     return lat8_q4(w, __half2half2(d));
@@ -74,7 +74,7 @@ __device__ __forceinline__ uint2 lat8_h4(const uint8_t* rec, int kv, int c4) {
 __device__ __forceinline__ uint4 lat8_h8(const uint8_t* rec, int kv, int c8) {
     const uint2 w = ((const uint2*) rec)[c8];
     const __half d = ((const __half*) (rec + kv))[c8 >> 2];
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (!lat8_normal(d)) {
         const uint2 lo = lat8_q4_f32(w.x, __half2float(d)), hi = lat8_q4_f32(w.y, __half2float(d));
         return make_uint4(lo.x, lo.y, hi.x, hi.y);

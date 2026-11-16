@@ -19,7 +19,7 @@ set(GLM_DSA_ENGINE_SOURCES
   src/core/glm_dsa_cpu_ref.cpp
 )
 
-if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
   target_sources(strata_engine PRIVATE ${GLM_DSA_ENGINE_SOURCES})
 endif()
 

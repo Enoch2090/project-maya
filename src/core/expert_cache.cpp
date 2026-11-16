@@ -2,7 +2,7 @@
 #include "strata/core/expert_cache.hpp"
 
 #include <cuda_runtime.h>
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include <cuda.h>   // (the virtual memory API's types; its functions come through the runtime's entry points)
 #endif
 
@@ -162,7 +162,7 @@ ExpertCache::~ExpertCache() { close(); }
 // physical memory, each mapped and then released (the mapping holds it), so unmapping a piece gives its memory back
 // to the driver, and a new piece mapped at the same address later makes the range whole again.  HIP builds keep
 // the one allocation (lendable() is false; the engine then lends only memory that is already free).
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 namespace {
 struct Vmm {
     CUresult (*dev_get)(CUdevice*, int) = nullptr;
@@ -377,7 +377,7 @@ bool ExpertCache::lend_tail(uint64_t bytes, uint64_t keep_bytes, uint64_t& from,
     return ok;
 }
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 bool ExpertCache::ensure_blocking_staging(std::size_t bytes, std::string& err) {
     if (bytes <= blocking_staging_bytes_) return true;
     void* next = nullptr;
@@ -455,7 +455,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     blob_ = blob_bytes;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
         close();
         return false;
@@ -490,7 +490,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     slots_ = (int64_t) slot_bytes.size();
     blob_ = mx;
     off_ = std::move(off);
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
         close();
         return false;
@@ -501,7 +501,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 }
 
 void ExpertCache::close() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (blocking_staging_) (void) cudaFreeHost(blocking_staging_);
     blocking_staging_ = nullptr;
     blocking_staging_bytes_ = 0;
@@ -606,7 +606,7 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
         return false;
     }
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // Bound HIP's pageable-source staging to one expert instead of repeatedly
     // registering regions of the mmap. The blocking copy completes before reuse.
     if (!blocking_staging_ || n > blocking_staging_bytes_) {

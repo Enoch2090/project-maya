@@ -5,7 +5,7 @@
 // Other values bypass dispatch. CUDA does not compile these variants.
 #include "strata/kernels/glm_fast.hpp"
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 namespace strata::kernels::glmf::hip_expert_bench {
 enum class Variant {
     baseline, production, signs, waves8, rows2, rows8, global_grid, global_plain,
@@ -20,7 +20,7 @@ void down(Variant variant, int type, const MoeDev& d, int k, int n_embd, int n_f
 }
 #endif
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 namespace strata::kernels::glmf::hip_expert_bench {
 // The RDNA3 dense GEMV (mv on gfx11, by default the gfx115x APUs): r rows per wave, u super-blocks in flight, wpb waves per block,
 // lds > 0 the Q6_K activations staged in LDS, lds < 0 the default's choice.  r == 0 launches the original kernels,

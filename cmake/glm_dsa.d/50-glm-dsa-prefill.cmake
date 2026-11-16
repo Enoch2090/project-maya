@@ -12,11 +12,11 @@
 if(TARGET strata_engine)
   # glm_prefill_dsa.cu joins on any GPU backend: Maya-owned glm_prefill.cu calls it
   target_sources(strata_engine PRIVATE src/core/glm_dsa_prompt_plan.cpp src/core/glm_prefill_dsa.cu)
-  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA)
     target_sources(strata_engine PRIVATE src/kernels/cuda/glmd_batch.cu)
   endif()
 endif()
-if(TARGET strata_mmq AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
+if(TARGET strata_mmq AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA))
   target_sources(strata_mmq PRIVATE src/prefill/moe_mmq_strata.cu)
 endif()
 
@@ -30,7 +30,7 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME glmd_batch_cpu_test COMMAND glmd_batch_cpu_test)
 endif()
 
-if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
   # GPU (label gpu, exit 77 without a device): batched prep == token prep bytes, tiled selection == glmd::topk on
   # every row (2,049 / 9,000 tokens), prompt MLA F32 / WMMA (CUDA) vs the twin, HF router rows, the q8_1 MMQ clamp.
   add_executable(glmd_batch_parity tests/glm_dsa/glmd_batch_parity.cu)
@@ -55,7 +55,7 @@ if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND TARGET strata_mmq)
   target_link_libraries(glmd_mmq_sm70_test PRIVATE strata_mmq)
   add_test(NAME glmd_mmq_sm70_test COMMAND glmd_mmq_sm70_test)
 endif()
-if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_mmq)
+if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_mmq)
   # GPU: grouped MMQ with ids == per-expert launches == host reference, per type (B9.8). Its host side runs on every
   # hardware thread: an estimated 2-4 min on the test PC's 80 threads at 2.0 GHz (on one thread it went past 900 s).
   add_executable(glmd_mmq_ids_test tests/glm_dsa/glmd_mmq_ids_test.cu)

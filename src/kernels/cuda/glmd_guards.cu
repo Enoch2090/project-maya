@@ -282,7 +282,7 @@ int mmq_malloc(void** p, size_t bytes) {
     void* q = nullptr;
     const cudaError_t e = cudaMalloc(&q, mmq_padded(bytes));
     if (e != cudaSuccess) return (int) e;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // the legacy-stream zeroing must land before the tiers' non-blocking streams copy experts in: Windows' HIP runtime
     // submits legacy-stream work only when the host waits on it (#133), so wait for it here (allocation time only)
     cudaError_t z = cudaMemset(q, 0, mmq_padded(bytes));

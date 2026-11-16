@@ -856,7 +856,7 @@ bool Verifier::capture(int T, std::string& err) {
         err = std::string("verify: end capture: ") + cudaGetErrorString(ce);
         return false;
     }
-#if !defined(STRATA_USE_HIP)   // a CUDA debug listing (node types, kernel names)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))   // a CUDA debug listing (node types, kernel names)
     if (std::getenv("MAYA_VERIFY_NODES") != nullptr) {   // what the window graph holds
         size_t nn = 0;
         cudaGraphGetNodes(graph, nullptr, &nn);
@@ -983,7 +983,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // 1 that (the default on Windows + HIP), 2 before every window (a diagnosis arm)
     static const int sync_mode = [] {
         if (const char* v = std::getenv("MAYA_QWEN_SYNC")) return std::atoi(v);
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         return 1;
 #else
         return 0;

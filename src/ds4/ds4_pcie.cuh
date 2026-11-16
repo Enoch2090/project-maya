@@ -41,7 +41,7 @@ struct Mats {
 // the device's clock in ns (NVIDIA's globaltimer; HIP's wall clock, 100 MHz on gfx11/gfx12); 0 on other AMD GPUs,
 // whose wall clock may tick at another rate - the host then times the pull itself
 __device__ __forceinline__ unsigned long long pull_clock() {
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
     return t;

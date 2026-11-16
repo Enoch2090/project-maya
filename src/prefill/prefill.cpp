@@ -467,7 +467,7 @@ const MmqPlan& mmq_plan() {
 // the activations stay FP16 (mixed_h, gathered by src; H reused as FP16), so Xq and Hq are not sized and H is a
 // view of xn16 (T * D uint16 >= T * 640).
 bool wmma_buffers() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return false;
 #else
     static const bool covered = [] {

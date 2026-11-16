@@ -49,7 +49,7 @@ constexpr size_t kBand = 64u << 20;  // a GEMM's FP16 weight band (bytes): the r
 // per 32 values (llama.cpp's q8_1 scale, ds4_gguf.cu's q8_quant - the same operations): rows of k F32 values (row r
 // at x + r ldx) -> q[r][k], d[r][k / 32] = max|x| / 127 (a warp a 32-block)
 __device__ __forceinline__ float warp_max32(float am) {
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
     am = fmaxf(am, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, am), 0x401f)));
     am = fmaxf(am, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, am), 0x201f)));
     am = fmaxf(am, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, am), 0x101f)));
@@ -131,7 +131,7 @@ __global__ void __launch_bounds__(kThreads) q8s_kernel(const float* __restrict__
     const int qi = am > 0.0f ? __float2int_rn(v / sc) : 0;
     q[(size_t) r * k + (size_t) b * 32 + lane] = (int8_t) qi;
     int sm = qi;
-#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx906__)
     sm += __builtin_amdgcn_ds_swizzle(sm, 0x201f);
     sm += __builtin_amdgcn_ds_swizzle(sm, 0x101f);
     sm += __builtin_amdgcn_update_dpp(0, sm, 0x4e, 0xf, 0xf, false);
@@ -193,7 +193,7 @@ __global__ void __launch_bounds__(128) comb_kernel(const Comb a) {
 __device__ unsigned g_timeouts = 0;
 __global__ void wait_kernel(const unsigned* p, unsigned v, unsigned long long limit) {
     if (threadIdx.x != 0) return;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     const unsigned long long t0 = wall_clock64();   // (limit: 120 s of its ticks, the host's hipDeviceAttributeWallClockRate)
 #else
     unsigned long long t0;
@@ -203,7 +203,7 @@ __global__ void wait_kernel(const unsigned* p, unsigned v, unsigned long long li
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
 #endif
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         const unsigned long long t = wall_clock64();
 #else
         unsigned long long t;
@@ -217,7 +217,7 @@ __global__ void wait_kernel(const unsigned* p, unsigned v, unsigned long long li
     __threadfence_system();
 }
 unsigned long long wait_limit() {   // 120 s in the wait kernel's clock
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     static const unsigned long long l = [] {
         int dev = 0, khz = 0;
         if (hipGetDevice(&dev) != hipSuccess || hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) !=
@@ -326,7 +326,7 @@ bool prepare(cudaStream_t s) { return scratch(s) != nullptr; }
 void set_gemm(int backend) { g_gemm.store(backend == 1 && gemm_lt_available() ? 1 : 0); }
 int gemm_backend() { return g_gemm.load(); }
 bool gemm_lt_available() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return strata::ds4::lt::available();
 #else
     return false;

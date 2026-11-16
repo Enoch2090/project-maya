@@ -220,7 +220,7 @@ bool mixer_setup(GlmDsaFast& X, const Glm5Geometry& g, int64_t max_ctx, std::str
     d.eps = g.norm_eps;
     d.idx_ln_eps = g.idx_ln_eps;
     d.kq_scale = glmd::attn_scale(g.qk_head());
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     d.pol = glmd::decode_policy_built(glmd::decode_policy_env());   // (no WMMA kernels in a HIP build)
 #else
     d.pol = glmd::decode_policy_env();

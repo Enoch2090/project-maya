@@ -221,7 +221,7 @@ private:
     std::string vmm_err_;
     bool want_lend_ = false;
     LendableArena arena_;                 ///< the slots' memory when it is lendable (not ok: one cudaMalloc)
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     bool ensure_blocking_staging(std::size_t bytes, std::string& err);
     uint8_t* blocking_staging_ = nullptr;
     std::size_t blocking_staging_bytes_ = 0;

@@ -21,10 +21,10 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include <mma.h>
 #endif
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include "exl3_hip_scalar.hpp"
 #endif
 #include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
@@ -40,7 +40,7 @@
 #include <type_traits>
 #include <utility>
 
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 namespace strata::kernels::exl3::legacy {   // exl3_legacy.cu: v1.1.8's decode kernels
 int launch_errors();
 bool prepare(cudaStream_t s);
@@ -362,12 +362,12 @@ __device__ __forceinline__ void chunk_store(float (&v)[4], const float (&s)[4], 
 // with a __syncthreads (out complete).
 constexpr int kTok = 8;   // activations a block takes at once (the MMA's n)
 
-#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define EXL3_TC 1
 #endif
 
 // RDNA 3 / 4: v_dot2_f32_f16 - two FP16 products and their FP32 sum onto c in one instruction (no conversions)
-#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && (defined(__GFX11__) || defined(__GFX12__))
 #define EXL3_DOT2 1
 typedef _Float16 exl3_h2 __attribute__((ext_vector_type(2)));
 __device__ __forceinline__ float dot2_acc(uint32_t a, uint32_t b, float c) {
@@ -390,18 +390,26 @@ __device__ __forceinline__ void mma_f32(float (&c)[4], uint32_t a0, uint32_t a1,
 }
 #endif
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // Preserve the scalar fallback rounding tree when one-row specialization changes compiler scheduling.
 // Empty VGPR constraints prevent reassociation without adding arithmetic instructions.
 __device__ __forceinline__ float dot4_acc_exact(float a, const float* v, float x0, float x1, float x2, float x3) {
     float p = __fmul_rn(v[0], x0);
+#if !defined(STRATA_USE_MUSA)   // (the empty asm barriers are AMD's: MUSA's clang has no 'v' operand to claim)
     asm volatile("" : "+v"(p));
+#endif
     p = __fmaf_rn(v[1], x1, p);
+#if !defined(STRATA_USE_MUSA)
     asm volatile("" : "+v"(p));
+#endif
     p = __fmaf_rn(v[2], x2, p);
+#if !defined(STRATA_USE_MUSA)
     asm volatile("" : "+v"(p));
+#endif
     p = __fmaf_rn(v[3], x3, p);
+#if !defined(STRATA_USE_MUSA)
     asm volatile("" : "+v"(p));
+#endif
     return __fadd_rn(a, p);
 }
 #endif
@@ -430,7 +438,7 @@ __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, s
 // words)
 template <int K2, int cb, bool Perm = false, bool Pk = false>
 __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], uint32_t* st, int lane, uint32_t (&f)[4]) {
-#if defined(STRATA_USE_HIP) && (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
     if constexpr (Perm && K2 == 4) {
         // K = 2 without the stage: lane l's steps are in words l / 2 and l / 2 - 1 (the tile's last for l < 2), which
         // lanes 0-15 hold - v_permlane16 within a row of 16 lanes, v_permlanex16 from the other row for lanes 16-31;
@@ -504,7 +512,7 @@ constexpr int kMinBlocksMv = K2 <= 8 ? 2 : 3;
 template <int K2>
 constexpr int kMinBlocksMv = 2;
 #endif
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #define EXL3_BOUNDS(n) __launch_bounds__(kThreads)
 #else
 #define EXL3_BOUNDS(n) __launch_bounds__(kThreads, n)
@@ -513,7 +521,7 @@ constexpr int kMinBlocksMv = 2;
 // Left to the compiler it can stay a call - it did in v1.1.52, and mv_kernel's still was in v1.1.57 - and a call's
 // arguments arrive in vector registers, so the block's activation count reads as per-lane and every `cc < nc` of the
 // token loop is a branch on the lane mask.  The same arithmetic, the same bits.
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #define EXL3_DECODE_INLINE [[clang::always_inline]]
 #else
 #define EXL3_DECODE_INLINE
@@ -595,7 +603,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
                     const __half* xr = xq + cc * kCols + s * 16 + 2 * t;
                     const float x0 = __half2float(xr[0]), x1 = __half2float(xr[1]);
                     const float x2 = __half2float(xr[8]), x3 = __half2float(xr[9]);
-                    #if defined(STRATA_USE_HIP)
+                    #if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
                     if constexpr (Tokens == 1) {
                         acc[cc][0] = dot4_acc_exact(acc[cc][0], v, x0, x1, x2, x3);
                         acc[cc][1] = dot4_acc_exact(acc[cc][1], v + 4, x0, x1, x2, x3);
@@ -685,7 +693,7 @@ struct KBatch {
 // of their own after the GEMVs (mv_reduce_kernel's note), and the experts' input split (EXL3_XSPLIT) is offered - the
 // device code of those GPUs (EXL3_SEP_DEV) and the host's choice per GPU (sep_sums) go together.  Every other GPU keeps
 // the last block's hand-off (on a Radeon 8060S, gfx1151, the same bits but not faster: the routed experts ~4% slower)
-#if defined(STRATA_USE_HIP) && (defined(__gfx942__) || defined(__gfx950__))
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && (defined(__gfx942__) || defined(__gfx950__))
 #define EXL3_SEP_DEV 1
 #endif
 
@@ -744,7 +752,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
     if (threadIdx.x == 0) J.cnt[g] = 0u;
 }
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // AMD: a split launch's sums, added up by a second kernel.  mv_kernel's last-block hand-off costs a fence per block,
 // and at agent scope that is a write-back and an invalidate of the XCD's whole L2 (buffer_wbl2 / buffer_inv: on a
 // MI350X most of a 6-bit attention GEMV's time - DeepSeek-V4.1's wq_b, 512 blocks: 77.7 -> 30.1 us, wo_b 125.8 -> 40.9
@@ -800,7 +808,7 @@ struct KMoe {
     int k, n_embd, n_ff;
     float limit;
     const int* skip;     // set_skip's flag (nullptr: none)
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     float* xp;           // gS / dS > 1: the input splits' partial sums (xsplit, AMD)
     int gS, gkr, dS, dkr;   // gate / up and down: the input splits and their width (1, the whole input: none)
 #endif
@@ -859,7 +867,7 @@ __device__ __forceinline__ float combine(const float* plan_w, const float* p, in
     if (cpu_part != nullptr) m = __fadd_rn(m, *cpu_part);
     return __fadd_rn(m, sh);
 }
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // an input split's sums for one output in split order (p: split 0's, the next split's `stride` floats on), the loads
 // 8 at a time ahead of their adds
 __device__ __forceinline__ float split_sum(const float* p, int S, size_t stride) {
@@ -997,7 +1005,7 @@ struct KWin {
     size_t suh[3], svh[3], tr[3];
     int k, n_embd, n_ff;
     float limit;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     float* xp;           // (KMoe's)
     int gS, gkr, dS, dkr;
 #endif
@@ -1097,7 +1105,7 @@ __global__ void __launch_bounds__(kCols) win_combine_kernel(const KWin a) {
                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
 }
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // AMD: the pieces the last block of a pair / an output block runs elsewhere, as kernels of their own after the GEMVs
 // (mv_reduce_kernel's note: a fence a block is a write-back of the XCD's L2) - the same arithmetic, the same bits.
 // grid (n_ff / 128, k): moe_gate_up_kernel's clamped swiglu
@@ -1152,7 +1160,7 @@ static bool sep_sums() {
 #define EXL3_WIN_SWIGLU(a, groups, s) (void) 0
 #endif
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // an input split's (xsplit) sums, added up in split order and then on as the unsplit kernels: block_out into h / u
 // (gate / up) or the part rows (down).  grid (n_ff / 128, k): moe_gate_up_kernel's
 __global__ void __launch_bounds__(kCols) moe_gu_red_kernel(const KMoe a) {
@@ -1548,7 +1556,7 @@ __global__ void rows_f16_kernel(const float* __restrict__ x, int ldx, const int*
 // straight into mma.m16n8k16's B fragments - a lane's 8 steps ARE the fragment order (steps 0,1 / 2,3 rows 2t+{0,1} /
 // 2t+8+{0,1} of column g, steps 4..7 the same of column g + 8) - and multiplies every m-tile of the block with them.
 // The output rotation and svh run on the F32 tile in shared memory.
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 namespace tc {
 
 constexpr int BM = 32, MT = BM / 16, AP = 136;   // rows a block, its m-tiles, the A rows' pitch (halves)
@@ -1824,7 +1832,7 @@ __global__ void __launch_bounds__(kThreads) hip_set_kernel(SetArgs a, const floa
     }
 }
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // Wider scalar tiles reuse each decoded fragment across more routed rows.
 // Keep DOT2/FMA order, rotations and output rounding identical to block_gemv.
 template <int K2, int NR> struct HipScalarSmem {
@@ -2055,7 +2063,7 @@ __global__ void __launch_bounds__(kThreads) set_mix_kernel(const KSetMix a, KMix
 // multiple of 8 halves; the 8 rows a store takes stay on distinct banks).  wmma_now(): sm_7x unless
 // MAYA_EXL3_WMMA=0.
 constexpr int kXS = kCols + 8;   // an activation's pitch in xb (halves: 2-way LDS reads)
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 constexpr int kWtP = 9;          // wt's pitch, words a decoded output row (8 + 1: banks)
 #else
 constexpr int kWtP = 12;
@@ -2084,17 +2092,17 @@ struct WmmaSmem11 {
     uint32_t wt[kWarps * 16 * kWtP11];
     uint32_t stage[kWarps * 4 * K2];
 };
-#if defined(STRATA_USE_HIP) && defined(__GFX11__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__GFX11__)
 #define EXL3_WMMA 1
 typedef _Float16 exl3_h16 __attribute__((ext_vector_type(16)));
 typedef float exl3_f8 __attribute__((ext_vector_type(8)));
 typedef uint32_t exl3_u8 __attribute__((ext_vector_type(8)));
 #endif
-#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 800
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 800
 #define EXL3_WMMA_V70 1
 #endif
 // CDNA 4 (gfx950): v_mfma_f32_16x16x16_f16 on the wave64 - the wave's two logical warps' tiles are two products
-#if defined(STRATA_USE_HIP) && defined(__gfx950__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__gfx950__)
 #define EXL3_MFMA 1
 typedef _Float16 exl3_h4 __attribute__((ext_vector_type(4)));
 typedef float exl3_f4 __attribute__((ext_vector_type(4)));
@@ -2110,7 +2118,7 @@ typedef uint32_t exl3_u2 __attribute__((ext_vector_type(2)));
 // low output bits can differ. Full-model routing can amplify those differences in later layers.
 // Bitwise equality with the DOT2 path is therefore not the accuracy contract; the existing
 // CPU-reference tolerances, finite checks and output guards remain the operator contract.
-#if defined(STRATA_USE_HIP) && defined(__GFX12__)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) && defined(__GFX12__)
 #define EXL3_WMMA_RDNA4 1
 typedef _Float16 rdna4_h8 __attribute__((ext_vector_type(8)));
 typedef float rdna4_f8 __attribute__((ext_vector_type(8)));
@@ -2497,7 +2505,7 @@ __global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const flo
                                                          uint16_t* h, int ldh, float* y, int ldy) {
     wmma_set_body<K2, cb, gate_up, NR, Perm>(a, x, ldx, idx, h, ldh, y, ldy);
 }
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // gfx11's shaped prompt kernels (wmma_shape): the same, with the compiler fitting the registers to 8 waves a SIMD
 template <int K2, int cb, bool gate_up, int NR, bool Perm>
 __global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8)))
@@ -2569,7 +2577,7 @@ __global__ void __launch_bounds__(kThreads) hip_rows_kernel(Mat m, const uint16_
         }
     }
 }
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 static const char* hip_scalar_env(const char* internal, const char* maya, const char* native) {
     const char* v = std::getenv(internal);
     if (v == nullptr) v = std::getenv(maya);
@@ -2615,7 +2623,7 @@ static bool hip_scalar_set(const SetArgs& a, const float* x, int ldx, const int*
 #endif
 template <int K2, int cb> struct RunHipGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         if (hip_scalar_set<K2, cb, true>(a, x, ldx, idx, h, ldh, nullptr, 0, s)) return;
 #endif
         hip_set_kernel<K2, cb, true><<<dim3((a.max_rows + kTok - 1) / kTok, a.n_ff / kCols, a.n_exp), kThreads, 0, s>>>
@@ -2624,7 +2632,7 @@ template <int K2, int cb> struct RunHipGateUp {
 };
 template <int K2, int cb> struct RunHipDown {
     static void run(const SetArgs& a, const uint16_t* h, int ldh, float* y, int ldy, cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         if (hip_scalar_set<K2, cb, false>(a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy, s)) return;
 #endif
         hip_set_kernel<K2, cb, false><<<dim3((a.max_rows + kTok - 1) / kTok, a.n_embd / kCols, a.n_exp), kThreads, 0, s>>>
@@ -2666,7 +2674,7 @@ bool dispatch(int K2, int cb, A&&... args) {
 
 template <int K2, int cb> struct RunMv {
     static void run(const KBatch& b, int blocks, cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         // A one-row batch needs only one row of accumulators/scratch. Keep the input-split planner
         // and reduction order unchanged; a mixed/multi-row batch always uses the generic kernel.
         // Enabled by default on HIP; DS4_EXL3_MV1=0 is the explicit rollback.
@@ -2679,7 +2687,7 @@ template <int K2, int cb> struct RunMv {
     }
 };
 // AMD: the experts' launches with their input split (xsplit) - its blocks' z and the kernel that adds them up
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #define EXL3_XS(n) (n)
 #define EXL3_XS_RED(on, kernel, grid, a, s) \
     if (on) kernel<<<grid, kCols, 0, s>>>(a)
@@ -2720,7 +2728,7 @@ template <int K2, int cb> struct RunRows {
             m.trellis, m.ld > 0 ? m.ld : m.n / 16, m.suh, m.svh, m.k, dst, bf16);
     }
 };
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 template <int K2, int cb> struct RunGemm {
     static void run(const tc::GArgs& a, dim3 grid, cudaStream_t s) { tc::gemm_kernel<K2, cb><<<grid, kThreads, 0, s>>>(a); }
 };
@@ -2749,7 +2757,7 @@ constexpr size_t kCounters = 16384;
 constexpr size_t kCntGU = 8192;                    // the counters from here on: the experts' gate / up pairs
 constexpr size_t kHFloats = (size_t) 8 * 8192;     // the experts' h
 constexpr size_t kUFloats = (size_t) 128 * 4096;   // the experts' up values: a window's 16 tokens x 8, n_ff <= 4096
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 constexpr size_t kXPFloats = (size_t) 6 << 20;     // the experts' input split partials (xsplit, AMD): 24 MB
 // the split EXL3_XSPLIT asks for (1: none) - on gfx942 / gfx950 only (sep_sums: elsewhere the device code has no split)
 int xsplit_want() {
@@ -2761,7 +2769,7 @@ int xsplit_want() {
 }
 #endif
 struct Scratch {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     float* xp = nullptr;   // (xsplit_want() > 1 only)
 #endif
     float* part = nullptr;
@@ -2796,7 +2804,7 @@ Scratch* scratch(cudaStream_t s) {
         cudaMalloc(&sc.cnt, kCounters * sizeof(unsigned)) != cudaSuccess ||
         cudaMalloc(&sc.h, kHFloats * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&sc.u, kUFloats * sizeof(float)) != cudaSuccess ||
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         (xsplit_want() > 1 && cudaMalloc(&sc.xp, kXPFloats * sizeof(float)) != cudaSuccess) ||
 #endif
         cudaMemsetAsync(sc.cnt, 0, kCounters * sizeof(unsigned), s) != cudaSuccess) {
@@ -2822,7 +2830,7 @@ int sm_count() {
 // legacy-f32 on sm_6x only: its kernels are built for Pascal alone (exl3_legacy.cu's EXL3_F32_KERNEL), so sm_70 and
 // newer take v1.1.8's FP16 decode for it, the same bits.  The token path and the verify windows take the same family
 // on a device, so a window stays bit for bit its token path.  Asked once per device.
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // a decode-kernel name (MAYA_GLM_EXL3_DECODE's values) -> its number; 0 for none of them (unset, empty, other)
 int decode_choice(const char* v) {
     return v == nullptr                         ? 0
@@ -2863,7 +2871,7 @@ int decode_kernels_of(int dev) {
 #endif
 // the current device's
 int decode_kernels() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return 2;
 #else
     int dev = 0;
@@ -2957,7 +2965,7 @@ int mv_splits(const Mat& m) {
 
 int mv_cols(const Mat& m) {
     if (!supported(m)) return 0;
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (use_legacy()) return 4;   // (v1.1.8's kernels: the runs of four their callers have always used)
 #endif
     const int S = mv_splits(m);
@@ -2969,7 +2977,7 @@ int mv_cols(const Mat& m) {
 bool legacy_f32() { return decode_kernels() == 3; }
 
 bool prefer_legacy_f32(int dev) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     (void) dev;
     return false;
 #else
@@ -2980,7 +2988,7 @@ bool prefer_legacy_f32(int dev) {
 }
 
 void legacy_decode_table(int cb, bool f32, float* d_out, cudaStream_t s) {
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     int dev = 0, major = 0;
     cudaGetDevice(&dev);
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
@@ -2993,7 +3001,7 @@ void legacy_decode_table(int cb, bool f32, float* d_out, cudaStream_t s) {
 }
 
 int launch_errors() {
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return g_launch_errors.load(std::memory_order_relaxed) + legacy::launch_errors();
 #else
     return g_launch_errors.load(std::memory_order_relaxed);
@@ -3095,7 +3103,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         b.n = nb;
         b.skip = g_skip;
         if (!dispatch<RunMv>(m0.k2, m0.cb, b, blocks, s)) return false;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         int rblocks = 0, rnc = 0;
         for (int j = 0; j < nb; ++j)
             if (b.j[j].S > 1) rblocks += b.j[j].n / kCols, rnc = std::max(rnc, b.j[j].nc);
@@ -3106,7 +3114,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     return true;
 }
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // the routed experts' input split for an input of k (EXL3_XSPLIT, default 1 - the whole input a block): S blocks of
 // kr inputs, their partial sums added up in split order by the *_red kernels
 static void xsplit(int k, int& S, int& kr) {
@@ -3155,7 +3163,7 @@ static bool moe_args(const MoeArgs& a, KMoe& m, cudaStream_t s) {
     m.n_ff = a.n_ff;
     m.limit = a.limit;
     m.skip = g_skip;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return xsplit_set(a.k, a.n_embd, a.n_ff, sc->xp, m.xp, m.gS, m.gkr, m.dS, m.dkr);
 #else
     return true;
@@ -3287,7 +3295,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     w.n_embd = a.n_embd;
     w.n_ff = a.n_ff;
     w.limit = a.limit;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (!xsplit_set(a.T * 8, a.n_embd, a.n_ff, sc->xp, w.xp, w.gS, w.gkr, w.dS, w.dkr)) return false;
 #endif
     if (a.mix.n > 0) {
@@ -3309,7 +3317,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
 
 // mma_supported() for the current device, cached (the prompt path's launches ask it each time)
 bool mma_now() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return false;
 #else
     static int known[64];   // 0: not asked yet, 1: no, 2: yes
@@ -3328,7 +3336,7 @@ bool mma_now() {
 // with the same weight and operand formats. Decode/verify kernels keep their arithmetic;
 // a changed prefill state can still change later routing or generated tokens.
 static bool wmma_now() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     static const bool off = std::getenv("EXL3_WMMA") != nullptr && std::atoi(std::getenv("EXL3_WMMA")) == 0;
     static int known[64];   // 0: not asked yet, 1: no, 2: yes
     int dev = 0;
@@ -3370,7 +3378,7 @@ static int wmma_rows() {
 }
 template <class F>
 static void with_rows(F&& f) {   // (f(std::integral_constant<int, wmma_rows()>{}))
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (wmma_rows() == 16) f(std::integral_constant<int, 16>{});
     else f(std::integral_constant<int, 32>{});
 #else
@@ -3384,7 +3392,7 @@ static void with_rows(F&& f) {   // (f(std::integral_constant<int, wmma_rows()>{
 // -15 %); from 128 rows a set, 64-row blocks at 6 waves (another -7 / -12 % at K2 4 / 5).  The same bits.  Other K2,
 // other GPUs, EXL3_WMMA_ROWS set or EXL3_WMMA_SHAPE=0: the uniform blocks
 static bool wmma_shape() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     static const bool off = std::getenv("EXL3_WMMA_ROWS") != nullptr ||
                             (std::getenv("EXL3_WMMA_SHAPE") != nullptr && std::atoi(std::getenv("EXL3_WMMA_SHAPE")) == 0);
     static signed char known[64] = {};
@@ -3404,7 +3412,7 @@ static bool wmma_shape() {
 }
 template <int K2, int cb> struct RunWmmaGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         if constexpr (K2 == 4 || K2 == 5)
             if (wmma_shape()) {
                 auto go = [&](auto nr, auto w6) {
@@ -3432,7 +3440,7 @@ template <int K2, int cb> struct RunWmmaGateUp {
 };
 template <int K2, int cb> struct RunWmmaDown {
     static void run(const SetArgs& a, const uint16_t* h, int ldh, float* y, int ldy, cudaStream_t s) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         if constexpr (K2 == 4 || K2 == 5)
             if (wmma_shape()) {
                 auto go = [&](auto nr, auto w6) {
@@ -3460,7 +3468,7 @@ template <int K2, int cb> struct RunWmmaDown {
 };
 
 bool prompt_tc() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return false;
 #else
     return mma_supported() || wmma_now();
@@ -3470,7 +3478,7 @@ bool prompt_tc() {
 bool prompt_wmma() { return wmma_now(); }
 
 bool mma_supported() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return false;
 #else
     int dev = 0, major = 0;
@@ -3486,7 +3494,7 @@ void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx,
         if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
         if (sa.eptr == nullptr || !mixed_ok(sa.mix, "set_gate_up")) return;
         const KMix k = kmix(sa.mix);
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         if (wmma_now()) {
             mix_launch(sa.mix, [&](auto cb) {
                 with_rows([&](auto nr) {
@@ -3508,7 +3516,7 @@ void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx,
         launch_check("set_gate_up (mixed)");
         return;
     }
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (!mma_now()) {   // (before sm_80: the portable kernels - on sm_7x the wmma ones)
         if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
         if (wmma_now() && sa.lay.k2[0] == sa.lay.k2[1] &&
@@ -3574,7 +3582,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
         if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
         if (sa.eptr == nullptr || !mixed_ok(sa.mix, "set_down")) return;
         const KMix k = kmix(sa.mix);
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         if (wmma_now()) {
             mix_launch(sa.mix, [&](auto cb) {
                 with_rows([&](auto nr) {
@@ -3596,7 +3604,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
         launch_check("set_down (mixed)");
         return;
     }
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
     if (!mma_now()) {   // (before sm_80: the portable kernels - on sm_7x the wmma ones)
         if (wmma_now() && dispatch<RunWmmaDown>(sa.lay.k2[2], sa.lay.cb, sa, h16, ldh, y, ldy, s)) {
@@ -3643,7 +3651,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
 }
 
 void gemm_rows(const Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy, float beta, cudaStream_t s) {
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (rows <= 0) return;
     if (!mma_now()) {   // (before sm_80: the portable kernels)
         if (!supported(m) || !dispatch<RunHipRows>(m.k2, m.cb, m, x16, ldx, rows, y, ldy, beta, s))

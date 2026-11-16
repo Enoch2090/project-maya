@@ -19,7 +19,7 @@
 #include "ds4_draft_placement.hpp"
 
 #include "ds4_gguf.cuh"
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include "ds4_iq.cuh"
 #endif
 #include "ds4_gguf_cpu.hpp"
@@ -127,7 +127,7 @@ size_t align256(size_t n) { return (n + 255) & ~(size_t) 255; }
 uint64_t ram_avail();
 cudaError_t mem_info(size_t* free_b, size_t* total_b) {
     const cudaError_t e = cudaMemGetInfo(free_b, total_b);
-#if !defined(_WIN32) && !defined(STRATA_USE_HIP)
+#if !defined(_WIN32) && !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     const auto env = [](const char* k) {   // (MAYA_DS4_*, else DS4_*)
         const char* v = std::getenv((std::string("MAYA_") + k).c_str());
         return v != nullptr ? v : std::getenv(k);
@@ -144,7 +144,7 @@ cudaError_t mem_info(size_t* free_b, size_t* total_b) {
         }
     }
 #endif
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
+#if defined(_WIN32) && (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     int dev = 0;
     if (e != cudaSuccess || cudaGetDevice(&dev) != cudaSuccess) return e;
     static std::mutex mu;
@@ -1055,7 +1055,7 @@ struct Worker {
 struct Group {
     std::vector<int> mem;   // device indices, member order (member 0 the lead)
     ArGroup ar, arb;        // a window's all-reduces, a chunk's
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || defined(DS4_CUDA_PEER_AR)
     std::array<PeerAr, 2> peer_arb{};
     bool peer_arb_on = false;
 #endif
@@ -1095,7 +1095,7 @@ struct WinPlan {
 // ------------------------------------------------------------------ the model
 struct Model::Impl {
     Options o;
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || defined(DS4_CUDA_PEER_AR)
     std::atomic<bool> peer_ar_failed{false}; // sticky across reset: reload after a transport failure
 #endif
     // abliteration (ds4_ablate.hpp): the direction on the host, its scale, the start-up line describing it
@@ -1700,7 +1700,7 @@ struct Model::Impl {
     // tokens), a group's beside its all-reduces.  HIP keeps them on the layer's stream: its two cross-stream waits a layer
     // may each cost a round trip through the host on Windows (~1 ms a layer: DS4_HOST_FREE's note).  DS4_HC_STREAM=0 /
     // 1: never / always
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     static constexpr bool kHcStream = false;
 #else
     static constexpr bool kHcStream = true;
@@ -2632,7 +2632,7 @@ struct Model::Impl {
         // (a member with a small BAR1 - 256 MiB, no ReBAR - takes the copy engines' P2P but not the kernels' loads
         // and stores: ar2_kernel spun forever on a pair of them, whichever side held the buffers, even 64 KB of them)
         bool reach = true;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         // (#809: with the BAR read right, AMD cards engage the peer buffers and the first request hangs in ar2_kernel on
         // a 2x RX 7900 XTX pair; until that is understood they stay host-mapped, as they did while the BAR read as 0)
         reach = false;
@@ -3059,7 +3059,7 @@ struct Model::Impl {
     // same bits (gemv_f32 widens each value exactly; DS4_ROUTER_CHECK=1 compares them at load) - another dtype as F32
     // (f32()).  0 (NVIDIA's default): the F32 copy for every dtype, as before
     bool gate(Dev& d, const std::string& name, GateW& g, std::string& err, size_t* acct, size_t want) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         constexpr bool kBf16Default = true;
 #else
         constexpr bool kBf16Default = false;
@@ -3634,7 +3634,7 @@ struct Model::Impl {
             // (#621, 2x / 4x Radeon PRO V620) - there every stream keeps the default priority, as before v1.1.31.
             static const char* prio_env = std::getenv("DS4_STREAM_PRIO");
             bool prio_on = prio_env == nullptr || std::atoi(prio_env) != 0;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
             if (prio_env == nullptr) {
                 cudaDeviceProp prop{};
                 if (cudaGetDeviceProperties(&prop, d.id) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx103", 6) == 0) {
@@ -5056,7 +5056,7 @@ struct Model::Impl {
                 workers.back()->start();
             }
         if (cp_pin_last()) cp_pin();   // (#589: after every pinned buffer above, before the paths are timed)
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || defined(DS4_CUDA_PEER_AR)
         if (!init_peer_ar(err)) return false; // after expert placement: optional scratch does not shrink the expert cache
 #endif
         // Opt-in startup work only: a calibration of one representative layer does not prepare every
@@ -5200,7 +5200,7 @@ struct Model::Impl {
                               (int) D, c.o16, CUDA_R_16F, (int) D, &zero, c.q, CUDA_R_32F, (int) nc, CUBLAS_COMPUTE_32F,
                               CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
         }
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         if (ok && nc >= 128 && nc * R <= qn && prompt_f16(devs[di])) {   // (DS4_PROMPT_F16: its FP16-out kernels too)
             ok = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) nc, (int) R, (int) D, &one, c.w16, CUDA_R_16F, (int) D,
                               c.o16, CUDA_R_16F, (int) D, &zero, c.q, CUDA_R_16F, (int) (2 * nc), CUBLAS_COMPUTE_32F,
@@ -5311,7 +5311,7 @@ struct Model::Impl {
     // Maya-XS, experts resident: 16K prompt 524 -> 550 tok/s, the first one after a start 475 -> 550; 1K 492, 256
     // 340) - so the default is capped there; DS4_CHUNK_GFX11=N changes the cap, 0 leaves the default
     int gfx11_chunk_cap(int C) const {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         const char* e = std::getenv("DS4_CHUNK_GFX11");
         const int cap = e != nullptr ? std::atoi(e) : kGfx11Chunk;
         if (cap <= 0 || C <= cap || devs.empty()) return C;
@@ -5620,7 +5620,7 @@ struct Model::Impl {
         return true;
     }
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // MAYA_DS4_PROMPT_F16=1: the prompt's dense GEMMs FP16 in and FP16 out on gfx103x (RDNA 2), widened in place.  rocBLAS
     // is tuned there only for FP16 out (37.7 TFLOPS on an RX 6900 XT, rocBLAS 5.6); FP16 in, FP32 out is a generic fallback
     // (5.6 TFLOPS; both measured with rocBLAS on that card).  Not bit-identical: each output is rounded to
@@ -5658,7 +5658,7 @@ struct Model::Impl {
             const int nc = std::min(cols, m.n - c0);
             if (m.fmt != 0) gg::rows(nc == m.n ? m : gg::view(m, c0, nc), c.w16, false, d.st);   // (a GGUF's)
             else x3::reconstruct_rows(nc == m.n ? m : x3::view(m, c0, nc), c.w16, false, d.st);
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
             if (beta == 0.0f && prompt_f16(d)) {   // (FP16 written at the start of each FP32 row: 2 ldy halves apart)
                 const float one16 = 1.0f;
                 const cublasStatus_t f16 = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, m.k, &one16, c.w16, CUDA_R_16F,
@@ -5694,7 +5694,7 @@ struct Model::Impl {
         return n;
     }
     bool fat_ready(Dev& d, Chunk& c, int D, int FF) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         (void) d, (void) c, (void) D, (void) FF;
         return false;
 #else
@@ -6109,7 +6109,7 @@ struct Model::Impl {
             const char* v = std::getenv("DS4_SKIP_UNPICKED");
             if (v != nullptr && std::strcmp(v, "alt") == 0) return INT_MIN;
             if (v != nullptr) return std::atoi(v) != 0 ? INT_MAX : 0;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
             return kSkipFiles;
 #else
             const char* r = std::getenv("DS4_SKIP_UNPICKED_ROWS");
@@ -6763,7 +6763,7 @@ struct Model::Impl {
             for (int i = i0; i < j; ++i) max_rows = std::max(max_rows, b[i + 1] - b[i]);
             if (nrows > 0) {
                 x3::SetArgs sa;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
                 gg::iq::MmqRowsScope mmq_rows(nrows, b + i0);
                 gg::iq::FusedScratchScope fused_x(c.y, (size_t) c.C * D * sizeof(float));   // (the int8 rows)
 #endif
@@ -8602,7 +8602,7 @@ struct Model::Impl {
         // (Strix Halo) reports itself integrated too, but its GPU memory is mostly a BIOS carve-out apart from the OS's
         // RAM, so it keeps the copy as before until measured there
         bool integ = false;
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         for (const Dev& d : devs) {
             int v = 0;
             if (cudaDeviceGetAttribute(&v, cudaDevAttrIntegrated, d.id) != cudaSuccess) (void) cudaGetLastError();
@@ -8812,7 +8812,7 @@ struct Model::Impl {
     // Windows' one-GPU path pins by need by default (MAYA_DS4_PIN_BY_NEED=0 turns it off): WDDM locks about half
     // the RAM, so pinning every copy fails, and its mapped pointer (one GPU) is what pin by need already takes
     bool pin_by_need() const {
-#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+#if defined(_WIN32) && !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         const char* v = std::getenv("MAYA_DS4_PIN_BY_NEED");
         if (ln_one && (v == nullptr || v[0] == '\0')) return true;
 #endif
@@ -8853,7 +8853,7 @@ struct Model::Impl {
     void one_gpu_path() {
         bool one = false;
         const char* why = "off (v1.1.27's path: not NVIDIA + one GPU)";
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         one = devs.size() == 1 && groups.size() == 1 && groups[0].mem.size() == 1 && helper_id < 0;
         if (one) {
             cudaDeviceProp pr{};
@@ -9078,7 +9078,7 @@ struct Model::Impl {
     unsigned copy_pin_flags(unsigned f) const {
         if (tri_of(ds4_env("DS4_COPY_PIN_RO")) != 1) return f;
         static bool said = false;
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         bool all = !devs.empty();
         for (const Dev& d : devs) {
             int v = 0;
@@ -9230,7 +9230,7 @@ struct Model::Impl {
         static const bool on = [] {
             const char* v = ds4_env("DS4_PIN_LAST");
             if (v != nullptr && v[0] != '\0') return std::atoi(v) != 0;
-#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+#if defined(_WIN32) && !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
             return true;
 #else
             return false;
@@ -17112,7 +17112,7 @@ struct Model::Impl {
     // running product at least cum_min) - the lazy head stops where it stops, but not before min_n rows
     bool draft_(int y, std::vector<int>& out, std::vector<float>& conf, std::string& err, int max_n = 0,
                 float conf_min = 0.0f, float cum_min = 0.0f, int min_n = 0) {
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || defined(DS4_CUDA_PEER_AR)
         if (peer_ar_failed.load(std::memory_order_relaxed)) {
             err = "peer all-reduce failed; model reload required";
             return false;
@@ -17940,7 +17940,7 @@ struct Model::Impl {
     static int ar2() {
         static const int v = [] {
             const char* e = ds4_env("DS4_AR2");
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
             if (e == nullptr || *e == 0) return 0;
 #else
             if (e == nullptr || *e == 0) return 1;
@@ -17957,7 +17957,7 @@ struct Model::Impl {
         }();
         return on;
     }
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || defined(DS4_CUDA_PEER_AR)
     // Optional transport scratch is allocated only after expert placement. Failure leaves the
     // original host transport intact for both ranks, without changing expert cache capacity.
     bool init_peer_ar(std::string& err) {
@@ -18171,7 +18171,7 @@ struct Model::Impl {
             const char* e = std::getenv("DS4_AR_DMA");
             return e == nullptr || std::atoi(e) != 0;
         }();
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || defined(DS4_CUDA_PEER_AR)
         Group& pg = groups[(size_t) d.grp];
         if (pg.peer_arb_on) {
             // A failed launch cannot silently switch a single rank to another transport.
@@ -20757,7 +20757,7 @@ struct Model::Impl {
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1,
                         const FeedPlan* whole = nullptr, int k0 = 0, int k1 = 0, int after = 0,
                         const std::vector<std::pair<int64_t, bool>>* inner = nullptr) {
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || defined(DS4_CUDA_PEER_AR)
         if (peer_ar_failed.load(std::memory_order_relaxed)) {
             err = "peer all-reduce failed; model reload required";
             return false;
@@ -21108,7 +21108,7 @@ struct Model::Impl {
                              "(rows handed over in %.0f ms%s)\n", n, run.T.size(), trc_lent - trc_t0, trc_go - trc_lent,
                              trc_done - trc_go, now_ms() - trc_done, ptx.send_ms, ptx.shm ? ", shared memory" : "");
         }
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || defined(DS4_CUDA_PEER_AR)
         if (!check_peer_ar(err)) return false;
         // A worker's early failure can leave peers with different submission sequences. Do not reuse the model.
         for (const std::string& e : errs)
@@ -21149,7 +21149,7 @@ struct Model::Impl {
         const double trc_back = now_ms();
         st.layer_ms += now_ms() - tl;
         eg_stats();
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         if (prompt_f16_check())   // (DS4_PROMPT_F16_CHECK: FP16's range, on every device)
             for (Dev& dv : devs) {
                 if (!prompt_f16(dv)) continue;
@@ -21453,7 +21453,7 @@ struct Model::Impl {
     }
 
     bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || defined(DS4_CUDA_PEER_AR)
         if (peer_ar_failed.load(std::memory_order_relaxed)) {
             err = "peer all-reduce failed; model reload required";
             return false;
@@ -22776,7 +22776,7 @@ struct Model::Impl {
     // `spec` each run is a verify window (its backups kept, its drafter rings left for verify_multi to seed with the
     // rows it keeps), without it every row seeds its conversation's drafter rings here
     bool step_runs(const int* sv, const int* const* toks, const int* lens, int n, bool spec, std::string& err) {
-#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA)) || defined(DS4_CUDA_PEER_AR)
         if (peer_ar_failed.load(std::memory_order_relaxed)) {
             err = "peer all-reduce failed; model reload required";
             return false;

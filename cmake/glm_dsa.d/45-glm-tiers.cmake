@@ -49,7 +49,7 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME glm_tier_engine_test COMMAND glm_tier_engine_test)
   endif()
 
-  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND TARGET strata_engine)
+  if((STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_ENABLE_MUSA) AND TARGET strata_engine)
     # GPU: the split fetch / prefetch kernels and the h2d / d2h copy ops vs the unified blob (bit-exact); on one expert
     # the node-split CPU lane vs Maya's unsplit lane (max rel < 1e-5), and the lane (Q8_K activations) and the device's
     # moe_gate_up / moe_down (q8_1) each vs a double reference in its own activation format.

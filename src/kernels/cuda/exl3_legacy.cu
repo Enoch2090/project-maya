@@ -18,7 +18,7 @@
 //   * a matrix with more than 4096 inputs, or too few output blocks to fill the device, splits its inputs over
 //     blocks: the partial sums go to a per-stream scratch and the LAST block of an output block adds them up in
 //     split order (deterministic) and runs the output rotation.
-#if !defined(STRATA_USE_HIP)   // (AMD runs exl3.cu's kernels; EXL3 does not run there anyway)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))   // (AMD runs exl3.cu's kernels; EXL3 does not run there anyway)
 #include "strata/kernels/exl3.hpp"
 
 #include <cuda_fp16.h>
@@ -57,7 +57,7 @@ void launch_check(const char* what) {
 
 // ---------------------------------------------------------------- the codebooks
 __device__ __forceinline__ uint32_t bytesum_plus(uint32_t x, uint32_t acc) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return acc + (x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) + (x >> 24);
 #else
     return __dp4a(x, 0x01010101u, acc);

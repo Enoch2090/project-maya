@@ -170,7 +170,7 @@ bool launch_headwise(const HwArgs& a, int w_type, int extra_blocks, cudaStream_t
     return launch_check("headwise");
 }
 
-#if !defined(STRATA_USE_HIP)   // (the fused attention is nvcuda::wmma, CUDA builds only: HIP runs mla2)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))   // (the fused attention is nvcuda::wmma, CUDA builds only: HIP runs mla2)
 // ---------------------------------------------------------------- the fused attention
 #if GLMD_WMMA
 using FragAcc = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
@@ -372,7 +372,7 @@ __global__ void __launch_bounds__(256) fused_combine_kernel(const float* __restr
 // an on/off switch, default off ("auto" counts as on here: these dispatchers have no auto rule of their own)
 bool env_on(const char* name) { return strata::glmenv::env_switch(name, strata::glmenv::kOff, true) != strata::glmenv::kOff; }
 
-#if !defined(STRATA_USE_HIP)
+#if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // the attention kernel's dynamic shared memory above 48 KB, set once per device and instantiation
 template <int R>
 bool fused_smem_attr() {
@@ -394,7 +394,7 @@ int volta_idx_launch_errors();   // glmd_volta_idx.cu
 int volta_launch_errors() { return g_errors.load(std::memory_order_relaxed) + volta_idx_launch_errors(); }
 
 bool fused_mla_enabled() {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return false;   // the fused attention is a WMMA kernel of CUDA builds; mla_auto runs mla2 here
 #else
     static const bool on = env_on("MAYA_GLMD_FUSED_MLA");
@@ -430,7 +430,7 @@ bool headwise(const void* W, int w_type, const float* in, int n_head, int R, int
 }
 
 bool mla_fused(const FusedMla& a, void* stream) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     (void) a;
     (void) stream;
     refuse("mla_fused (a CUDA WMMA kernel: HIP builds run mla2)");
