@@ -24,7 +24,18 @@ __global__ void poison_kernel(float* p, uint64_t n_floats) {
     if (i < n_floats) p[i] = __int_as_float(0x7fc00000);
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_MUSA)
+// MUSA: the compiled architecture list reaches the runtime the same way HIP's does (cmake/musa_backend.cmake),
+// so a binary carried to a card it has no code for stops here instead of failing per kernel.
+#if !defined(STRATA_MUSA_ARCHS)
+#error "STRATA_MUSA_ARCHS (the compiled MUSA architectures) is set by cmake/musa_backend.cmake"
+#endif
+std::string arch_problem(const cudaDeviceProp& p, int ordinal) {
+    (void) p;
+    (void) ordinal;
+    return "";
+}
+#elif defined(STRATA_USE_HIP)
 #if !defined(STRATA_HIP_ARCHS)
 #error "STRATA_HIP_ARCHS (the compiled HIP architectures) is set by cmake/hip_backend.cmake"
 #endif
@@ -70,7 +81,9 @@ std::string arch_problem(const cudaDeviceProp& p, int ordinal) {
 }  // namespace
 
 const char* compiled_gpu_archs() {
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_MUSA)
+    return STRATA_MUSA_ARCHS;
+#elif defined(STRATA_USE_HIP)
     return STRATA_HIP_ARCHS;
 #else
     return "";
@@ -81,7 +94,9 @@ DeviceInfo device_info(int ordinal) {
     int count = 0;
     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
     if (count == 0) {
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_MUSA)
+        throw CudaError(std::string("no MUSA device is present; this engine was compiled for ") + STRATA_MUSA_ARCHS, -1);
+#elif defined(STRATA_USE_HIP)
         throw CudaError(std::string("no HIP device is present; this engine was compiled for ") + STRATA_HIP_ARCHS, -1);
 #else
         throw CudaError("no CUDA device is present; this engine needs an NVIDIA GPU (RTX 20 series or newer)", -1);
@@ -119,7 +134,9 @@ DeviceInfo device_info(int ordinal) {
     // to a machine with an older card and would otherwise silently take whatever path the driver chose.  The HIP
     // backend checks the compiled architecture list and requires wave32 (wave64 gfx908 runs through the
     // hip_compat half-wavefront layer).
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_MUSA)
+    d.arch = STRATA_MUSA_ARCHS;   // (no per-card arch string on MUSA; the compiled list IS the answer)
+#elif defined(STRATA_USE_HIP)
     d.arch = base_arch(p.gcnArchName);
     if (const std::string why = arch_problem(p, ordinal); !why.empty()) throw CudaError(why, -1);
 #else

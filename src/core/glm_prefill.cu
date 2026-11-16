@@ -34,7 +34,7 @@
 #include "strata/kernels/glm_batch.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/platform/env_switch.hpp"
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_fused_rdna4.hpp"
 #endif
@@ -182,7 +182,7 @@ KdaBufs carve_kda(Carve& c, size_t T, const Glm5Geometry& g) {
     return b;
 }
 
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 // The MLA batched products in FP16 with every head's tokens contiguous (hipBLAS picks far faster kernels than for the
 // F32 ones).  The prompt attention has three paths: the rocWMMA kernel on FP16 q_abs (f16q), the wave32 WMMA kernel on
 // F32 q_abs (wmma2), and the F32 kernel.  Both FP16 products and the WMMA attention are on by default;
@@ -245,7 +245,7 @@ bool wmma_env_on() {
     return want;
 }
 bool moe_wmma_on(int gu_type, int d_type, int E, int nff) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     (void) gu_type; (void) d_type; (void) E; (void) nff;
     return false;
 #else
@@ -274,8 +274,29 @@ bool moe_wmma_on(int gu_type, int d_type, int E, int nff) {
     return ok;
 #endif
 }
+// MAYA_GLM_MMQ=0: leave the prompt's expert products to the FP16 GEMM path (the one a type without an MMQ instance
+// already takes).  MUSA needs it: mmq on this hardware writes only a prefix of its output rows once a chunk has more
+// than a few rows (measured: rows 1-2 exact, 4 rows already 40% of the output untouched), which turns any prompt longer
+// than a handful of tokens into corrupted hidden states.  Same numbers everywhere else; only the prompt's speed changes.
+bool mmq_disabled() {
+    static const bool v = [] {
+        const char* e = getenv("MAYA_GLM_MMQ");
+        if (e != nullptr && e[0] != 0) return e[0] == '0';
+#if defined(STRATA_USE_MUSA)
+        // Measured on this hardware: an 8K prompt prefills at 267 tok/s on the FP16 expert products against 175 on
+        // MMQ (same sub-batch size), and MMQ stalls outright once the sub-batch passes a few thousand tokens.
+        // So MUSA takes the FP16 products unless MAYA_GLM_MMQ=1 asks for MMQ back.
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return v;
+}
 // whether MMQ multiplies an expert matrix of this type here: an instance for it, and on a V100 its sm_70 code (B14.2)
-bool expert_mmq(const Glm5Geometry& g, int t) { return mmq::supported(t) && glmpf::mmq_ok(g, t); }
+bool expert_mmq(const Glm5Geometry& g, int t) {
+    return !mmq_disabled() && mmq::supported(t) && glmpf::mmq_ok(g, t);
+}
 // whether the HIP fused expert kernel takes the layer (run_set's first branch; it has its own type list)
 bool experts_fused(const Glm5Geometry& g, int gu_type, int d_type) {
 #if defined(STRATA_HIP_PREFILL_FUSED)
@@ -406,7 +427,7 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
 // ones than the mixers; MAYA_GLM_PREFILL_SH_SUB overrides, sub_env sets it
 int shexp_sub(int sub_env) {
     if (sub_env > 0) return sub_env;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     return kSub;
 #else
     static const int v = [] {
@@ -427,7 +448,16 @@ int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, b
 #if defined(STRATA_USE_HIP)
     (void) T; (void) g; (void) kda; (void) dsa; (void) dense; (void) moe; (void) max_pools;
     return kSub;
+#elif defined(STRATA_USE_MUSA)
+    // The whole chunk, up to the 8192 the knob allows.  Measured on this hardware: an 8K prompt's prefill is
+    // 46.9 s with 256-token sub-batches, 35.6 s with 1024 and 30.7 s with 8192 - the mixers' projections and the
+    // shared expert are dequantized to FP16 once a sub-batch, and small sub-batches pay that again and again.
+    // The chunk's activation buffers grow with it (4.8 GB of the expert pool's loan at 8192; the engine's own
+    // budget check sizes the loan before this is used).
+    (void) g; (void) kda; (void) dsa; (void) dense; (void) moe; (void) max_pools;
+    return (int) std::min<size_t>(T, 8192);
 #else
+    // (the buffers' room decides it on NVIDIA)
     size_t room = 0;
     if (moe) { Carve m; carve_moe(m, T, kSub, g); room = m.off; }
     int ts = kSub;
@@ -675,7 +705,7 @@ struct Glm5Model::PrefillState {
     int max_pools = 0;
     cublasHandle_t blas = nullptr;
     void* ws = nullptr;
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     std::unique_ptr<strata::prefill::Gemm> lt;   // hipBLASLt with a tuning table (MAYA_HIPBLASLT_TUNING)
     bool lt_tried = false;
 #endif
@@ -1148,7 +1178,7 @@ static std::pair<int64_t, int64_t> weight_scratch(const Glm5Geometry& g, bool ha
     if (has_dsa)
         w32 = std::max<int64_t>({w32, (int64_t) g.n_head * g.kv_lora * g.qk_nope, (int64_t) g.n_head * g.v_head * g.kv_lora});
     int64_t w16 = std::max<int64_t>((int64_t) g.d_inner() * E, (int64_t) 2048 * E);
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     if (has_dsa)   // the MLA products' FP16 copy of wk_b / wv_b
         w16 = std::max<int64_t>({w16, (int64_t) g.n_head * g.kv_lora * g.qk_nope, (int64_t) g.n_head * g.v_head * g.kv_lora});
 #endif
@@ -2206,7 +2236,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // projection the GGUF keeps unquantized) is narrowed to FP16 the same way
     const auto hgemm_q = [&](const WSlot& w, int N, int Kd, const uint16_t* X16, int ldx, float* Y, int ldy, int Tn,
                              float beta) {
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
         if (!S->lt_tried) {
             S->lt_tried = true;
             if (getenv("MAYA_HIPBLASLT_TUNING")) {
@@ -2235,7 +2265,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     strata::kernels::exl3::view(*(const strata::kernels::exl3::Mat*) w.q, r0, n), S->w16, false, s);
             else
                 glmpf::dequant16(w.type, w.q, r0, n, Kd, S->w16, s);   // glm-dsa B9.1: dequant_f16 + glm-dsa's extra types
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
             if (S->lt && ldx == Kd) {
                 S->lt->f16(X16, S->w16, Y + r0, Tn, n, Kd, ldy, beta);
                 continue;
@@ -2266,7 +2296,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         pkv.stage_rows = S->kv_stage_rows;
         pio.kv = &pkv;
     }
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // glm-dsa (S7): the attention layer's FP16 projections through the same hipBLASLt GEMM as hgemm_q below (made here
     // when the layer comes first; the tuning tables' rows for its shapes, plain hipBLAS for a shape without one)
     if (g.arch == GlmArch::GlmDsa) {
@@ -3038,7 +3068,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                B.cells, B.n_sel, s);
                 S->mark("dsa_index", s);
                 // q_abs[t][h] = wk_b[h] (kv_lora x qk_nope) . q[t][h]
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
                 // FP16 products; q is packed per head into B.attn's space and the context into B.q_abs's (both idle there)
                 const bool f16 = mla_f16_on() && (int64_t) g.qk_nope <= 2 * (int64_t) g.v_head;
                 const MlaAttnPath attn_path = mla_attn_path();
@@ -3049,11 +3079,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 if (f16) {
                     bf16_to_f16<<<1024, 256, 0, s>>>(Ly.k_b, S->w16, (int64_t) g.n_head * g.kv_lora * g.qk_nope);
                     pack_heads_f16<<<2048, 256, 0, s>>>(B.q, hp_q, tn, g.n_head, g.qk_nope);
-                    blas_ck(hipblasGemmStridedBatchedEx(S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.kv_lora, tn, g.qk_nope, &one,
-                                                        S->w16, HIP_R_16F, g.qk_nope, (long long) g.kv_lora * g.qk_nope,
-                                                        hp_q, HIP_R_16F, g.qk_nope, (long long) tn * g.qk_nope, &zero,
-                                                        B.q_abs, use_f16q ? HIP_R_16F : HIP_R_32F, g.n_head * g.kv_lora,
-                                                        g.kv_lora, g.n_head, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
+                    blas_ck(cublasGemmStridedBatchedEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, g.kv_lora, tn, g.qk_nope, &one,
+                                                        S->w16, CUDA_R_16F, g.qk_nope, (long long) g.kv_lora * g.qk_nope,
+                                                        hp_q, CUDA_R_16F, g.qk_nope, (long long) tn * g.qk_nope, &zero,
+                                                        B.q_abs, use_f16q ? CUDA_R_16F : CUDA_R_32F, g.n_head * g.kv_lora,
+                                                        g.kv_lora, g.n_head, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
                             "q_abs f16");
                 } else
 #endif
@@ -3066,7 +3096,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         "q_abs");
                 }
                 S->mark("dsa_qabs", s);
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
                 if (use_f16q)
                     gb::mla_attn_f16q((const uint16_t*) B.q_abs, lat, B.cells,
                                       B.n_sel, g.n_sel_max(), g.n_head, g.kv_lora, 1.0f / std::sqrt((float) g.qk_nope), tn,
@@ -3081,15 +3111,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                              g.kv_lora, 1.0f / std::sqrt((float) g.qk_nope), tn, B.ctx, s, lat_q8_);
                 S->mark("dsa_attn", s);
                 // out[t][h] = wv_b[h] (v_head x kv_lora) . ctx[t][h]
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
                 if (f16) {
                     bf16_to_f16<<<1024, 256, 0, s>>>(Ly.v_b, S->w16, (int64_t) g.n_head * g.v_head * g.kv_lora);
                     pack_heads_f16<<<2048, 256, 0, s>>>(B.ctx, hp_c, tn, g.n_head, g.kv_lora);
-                    blas_ck(hipblasGemmStridedBatchedEx(S->blas, HIPBLAS_OP_T, HIPBLAS_OP_N, g.v_head, tn, g.kv_lora, &one,
-                                                        S->w16, HIP_R_16F, g.kv_lora, (long long) g.v_head * g.kv_lora,
-                                                        hp_c, HIP_R_16F, g.kv_lora, (long long) tn * g.kv_lora, &zero,
-                                                        B.attn, HIP_R_32F, g.n_head * g.v_head, g.v_head, g.n_head,
-                                                        HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
+                    blas_ck(cublasGemmStridedBatchedEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, g.v_head, tn, g.kv_lora, &one,
+                                                        S->w16, CUDA_R_16F, g.kv_lora, (long long) g.v_head * g.kv_lora,
+                                                        hp_c, CUDA_R_16F, g.kv_lora, (long long) tn * g.kv_lora, &zero,
+                                                        B.attn, CUDA_R_32F, g.n_head * g.v_head, g.v_head, g.n_head,
+                                                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
                             "mla out f16");
                 } else
 #endif
@@ -3110,7 +3140,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     dump_row("dsa_qr-" + Ls, B.qr, g.q_lora, tn - 1);
                     dump_row("dsa_q-" + Ls, B.q, g.n_head * g.qk_nope, tn - 1);
                     dump_row("dsa_iq-" + Ls, B.iq, g.idx_heads * g.idx_key, tn - 1);
-#if defined(STRATA_USE_HIP)
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
                     if (!f16)   // with the FP16 products q_abs holds FP16 / the packed context
 #endif
                     dump_row("pf_qabs-" + Ls, B.q_abs, g.n_head * g.kv_lora, tn - 1);
@@ -3989,7 +4019,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 return v ? std::max(0, std::atoi(v)) : -1;
             }();
             if (env >= 0) return env;
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_MUSA)
+            // MUSA measured: MMQ's prompt path runs its int8 dots through the shared-memory-poor FMA tier and is
+            // ~3x slower than the FP16 products (8K prompt: 59 vs 267 tok/s).  Take the FP16 path from the same
+            // 128-row threshold the sm_70 rule uses - every expert an 8K chunk routes has far more rows than that.
+            return 128;
+#elif defined(STRATA_USE_HIP)
             return 0;   // (MMQ only: the FP16 path is measured on Volta)
 #else
             static int blas_dev[16] = {};   // rows + 1 per device, 0: not looked at yet
@@ -4043,21 +4078,240 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         "gemm q down");
             }
         };
-        // in set order: runs of lighter experts through MMQ (run_set over the run), the heavy ones alone through cuBLAS
+        // ---- the batched FP16 expert products (MAYA_GLM_PREFILL_BATCH=1) -------------------------------
+        // One submission per kB experts instead of one per expert.  A per-expert GEMM at ~227 rows leaves most of
+        // the card idle (measured on this hardware: 10.2 TFLOP/s per expert against 74.6 with one batched call for
+        // the layer), because each call has only a few dozen thread blocks.  The weights are dequantized into one
+        // contiguous block per matrix and the activation rows are padded to max_rows per expert, so a single
+        // strided-batched GEMM covers the batch; the padded rows of the output are never read (each expert's
+        // nrows are copied into the window that place() returns).  Staging is per device and reused.
+        const bool batch_f16 = [] {
+            const char* v = getenv("MAYA_GLM_PREFILL_BATCH");
+            return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+        }();
+        constexpr int kB = 4, kRowCap = 512;
+        struct BatchStage { uint16_t *wgu, *wdn, *x16, *h16; float *gu, *y; };
+        static BatchStage g_bs[16] = {};
+        const auto batch_stage = [&]() -> BatchStage& {
+            int dev = 0;
+            cudaGetDevice(&dev);
+            if (dev < 0 || dev >= 16) dev = 0;
+            BatchStage& b = g_bs[dev];
+            if (b.wgu == nullptr) {
+                const size_t gu_elems = (size_t) 2 * nff * E, dn_elems = (size_t) E * nff;
+                const struct { void** p; size_t bytes; const char* what; } req[] = {
+                    {(void**) &b.wgu, (size_t) kB * gu_elems * sizeof(uint16_t), "wgu"},
+                    {(void**) &b.wdn, (size_t) kB * dn_elems * sizeof(uint16_t), "wdn"},
+                    {(void**) &b.x16, (size_t) kB * kRowCap * E * sizeof(uint16_t), "x16"},
+                    {(void**) &b.h16, (size_t) kB * kRowCap * nff * sizeof(uint16_t), "h16"},
+                    {(void**) &b.gu, (size_t) kB * kRowCap * 2 * nff * sizeof(float), "gu"},
+                    {(void**) &b.y, (size_t) kB * kRowCap * E * sizeof(float), "y"},
+                };
+                for (const auto& r : req) {
+                    const cudaError_t e = cudaMalloc(r.p, r.bytes);
+                    if (e != cudaSuccess) {
+                        std::fprintf(stderr, "glm prefill: batch staging %s (%zu B) failed: %s\n", r.what, r.bytes,
+                                     cudaGetErrorString(e));
+                        b.wgu = nullptr;
+                        return b;
+                    }
+                }
+            }
+            return b;
+        };
+        struct BItem { const uint8_t* blob; int a; int nrows; };
+        const auto run_blas_batch = [&](const std::vector<BItem>& its, int r0) {
+            namespace x3 = strata::kernels::exl3;
+            const int nb = (int) its.size();
+            int max_rows = 0;
+            for (const BItem& it : its) max_rows = std::max(max_rows, it.nrows);
+            BatchStage& b = batch_stage();
+            if (b.wgu == nullptr) {   // (no staging: the single-expert product still works)
+                for (const BItem& it : its) run_blas_q(it.blob, it.a, it.nrows, r0);
+                return;
+            }
+            const size_t gu_elems = (size_t) 2 * nff * E, dn_elems = (size_t) E * nff;
+            // Claim the output window BEFORE computing, as the single-expert product does.  The batch's experts are
+            // consecutive sorted rows (the caller breaks the batch wherever the run of heavy experts does), so
+            // place() only extends the window and never flushes here - and every row it returns is written by the
+            // copies at the end, before the caller's next flush reads it.  Computing first and placing afterwards
+            // let a flush at the window boundary read rows that were not written yet.
+            // The window must hold the whole batch: place() flushes whatever it holds when the next run does not fit,
+            // and a flush of rows this batch has not written yet feeds garbage into ffn.  The caller keeps batches
+            // inside one window, and this check refuses (falls back) if that ever stops being true.
+            const int first_a = r0 + its.front().a;
+            const int last_end = r0 + its.back().a + its.back().nrows;
+            if (!(w_hi > w_lo && first_a == w_hi && last_end - first_a <= W)) {
+                for (const BItem& it : its) run_blas_q(it.blob, it.a, it.nrows, r0);
+                return;
+            }
+            auto off = std::vector<int>(its.size());
+            for (int k = 0; k < nb; ++k) off[(size_t) k] = place(r0 + its[(size_t) k].a, its[(size_t) k].nrows);
+            for (int k = 0; k < nb; ++k) {
+                mmq::to_f16(Ly.gu_type, its[(size_t) k].blob, b.wgu + (size_t) k * gu_elems, (int64_t) gu_elems, s);
+                mmq::to_f16(Ly.d_type, its[(size_t) k].blob + Ly.down_off, b.wdn + (size_t) k * dn_elems,
+                            (int64_t) dn_elems, s);
+            }
+            for (int k = 0; k < nb; ++k)
+                x3::rows_f16(S->x, (int) E, M.row_tok + r0 + its[(size_t) k].a, its[(size_t) k].nrows, (int) E,
+                             b.x16 + (size_t) k * (size_t) max_rows * (size_t) E, s);
+            static const bool legacy_gemm = [] {
+                const char* v = getenv("MAYA_GLM_PREFILL_BATCH_LEGACYGEMM");
+                return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+            }();
+            // MAYA_GLM_PREFILL_BATCH_MODE=perexpert: the staging above (weights dequantized once per batch, the
+            // point of this path), but every expert still gets its own GEMM at its own row count - no padding, no
+            // strided batch.  Keeps the dequantization saving and the exact numeric shape of the single-expert
+            // product; used to separate the two effects when the batched call misbehaves.
+            static const bool perexpert = [] {
+                const char* v = getenv("MAYA_GLM_PREFILL_BATCH_MODE");
+                return v != nullptr && std::strcmp(v, "perexpert") == 0;
+            }();
+            if (perexpert) {
+                for (int k = 0; k < nb; ++k) {
+                    const int nr = its[(size_t) k].nrows, o = off[(size_t) k];
+                    float* GU = M.OUTP + (size_t) o * E;
+                    // (the same placement run_blas_q uses: gate/up at the END of the row block, ldg wide)
+                    const int ldg = 2 * (int) nff;
+                    float* G2 = GU + (size_t) nr * (size_t) (E - ldg);
+                    blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, ldg, nr, (int) E, &one,
+                                         b.wgu + (size_t) k * gu_elems, CUDA_R_16F, (int) E,
+                                         b.x16 + (size_t) k * (size_t) max_rows * (size_t) E, CUDA_R_16F, (int) E,
+                                         &zero, G2, CUDA_R_32F, ldg, CUBLAS_COMPUTE_32F,
+                                         CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "gemm batch gate/up (perexpert)");
+                    gb::swiglu_rows(G2, G2, nr, (int) nff, g.swiglu_exp, s, ldg);
+                    x3::rows_f16(G2, ldg, nullptr, nr, (int) nff,
+                                 b.h16 + (size_t) k * (size_t) max_rows * (size_t) nff, s);
+                    blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) E, nr, (int) nff, &one,
+                                         b.wdn + (size_t) k * dn_elems, CUDA_R_16F, (int) nff,
+                                         b.h16 + (size_t) k * (size_t) max_rows * (size_t) nff, CUDA_R_16F, (int) nff,
+                                         &zero, GU, CUDA_R_32F, (int) E, CUBLAS_COMPUTE_32F,
+                                         CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "gemm batch down (perexpert)");
+                }
+                return;
+            }
+            if (legacy_gemm) {
+                for (int k = 0; k < nb; ++k)
+                    blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) (2 * nff), its[(size_t) k].nrows,
+                                         (int) E, &one, b.wgu + (size_t) k * gu_elems, CUDA_R_16F, (int) E,
+                                         b.x16 + (size_t) k * (size_t) max_rows * (size_t) E, CUDA_R_16F, (int) E,
+                                         &zero, b.gu + (size_t) k * (size_t) max_rows * (size_t) (2 * nff),
+                                         CUDA_R_32F, (int) (2 * nff), CUBLAS_COMPUTE_32F,
+                                         CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "gemm batch gate/up (legacy)");
+                for (int k = 0; k < nb; ++k) {
+                    float* gk = b.gu + (size_t) k * (size_t) max_rows * (size_t) (2 * nff);
+                    gb::swiglu_rows(gk, gk, its[(size_t) k].nrows, (int) nff, g.swiglu_exp, s, (int) (2 * nff));
+                }
+                for (int k = 0; k < nb; ++k)
+                    x3::rows_f16(b.gu + (size_t) k * (size_t) max_rows * (size_t) (2 * nff), (int) (2 * nff), nullptr,
+                                 its[(size_t) k].nrows, (int) nff,
+                                 b.h16 + (size_t) k * (size_t) max_rows * (size_t) nff, s);
+                for (int k = 0; k < nb; ++k)
+                    blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) E, its[(size_t) k].nrows,
+                                         (int) nff, &one, b.wdn + (size_t) k * dn_elems, CUDA_R_16F, (int) nff,
+                                         b.h16 + (size_t) k * (size_t) max_rows * (size_t) nff, CUDA_R_16F, (int) nff,
+                                         &zero, b.y + (size_t) k * (size_t) max_rows * (size_t) E, CUDA_R_32F, (int) E,
+                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                            "gemm batch down (legacy)");
+                for (int k = 0; k < nb; ++k) {
+                    const int o = off[(size_t) k];
+                    cudaMemcpyAsync(M.OUTP + (size_t) o * (size_t) E,
+                                    b.y + (size_t) k * (size_t) max_rows * (size_t) E,
+                                    (size_t) its[(size_t) k].nrows * (size_t) E * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, s);
+                }
+                return;
+            }
+            blas_ck(cublasGemmStridedBatchedEx(
+                        S->blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) (2 * nff), max_rows, (int) E, &one,
+                        b.wgu, CUDA_R_16F, (int) E, (long long) gu_elems,
+                        b.x16, CUDA_R_16F, (int) E, (long long) ((size_t) max_rows * (size_t) E),
+                        &zero, b.gu, CUDA_R_32F, (int) (2 * nff),
+                        (long long) ((size_t) max_rows * (size_t) (2 * nff)), nb, CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    "gemm batch gate/up");
+            for (int k = 0; k < nb; ++k) {
+                float* gk = b.gu + (size_t) k * (size_t) max_rows * (size_t) (2 * nff);
+                gb::swiglu_rows(gk, gk, its[(size_t) k].nrows, (int) nff, g.swiglu_exp, s, (int) (2 * nff));
+            }
+            for (int k = 0; k < nb; ++k)
+                x3::rows_f16(b.gu + (size_t) k * (size_t) max_rows * (size_t) (2 * nff), (int) (2 * nff), nullptr,
+                             its[(size_t) k].nrows, (int) nff,
+                             b.h16 + (size_t) k * (size_t) max_rows * (size_t) nff, s);
+            blas_ck(cublasGemmStridedBatchedEx(
+                        S->blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) E, max_rows, (int) nff, &one,
+                        b.wdn, CUDA_R_16F, (int) nff, (long long) dn_elems,
+                        b.h16, CUDA_R_16F, (int) nff, (long long) ((size_t) max_rows * (size_t) nff),
+                        &zero, b.y, CUDA_R_32F, (int) E, (long long) ((size_t) max_rows * (size_t) E), nb,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    "gemm batch down");
+            static const bool dbg_sync = [] {
+                const char* v = getenv("MAYA_GLM_PREFILL_BATCH_SYNC");
+                return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+            }();
+            if (dbg_sync) cudaStreamSynchronize(s);
+            for (int k = 0; k < nb; ++k) {
+                const int o = off[(size_t) k];
+                cudaMemcpyAsync(M.OUTP + (size_t) o * (size_t) E,
+                                b.y + (size_t) k * (size_t) max_rows * (size_t) E,
+                                (size_t) its[(size_t) k].nrows * (size_t) E * sizeof(float),
+                                cudaMemcpyDeviceToDevice, s);
+            }
+            if (dbg_sync) cudaStreamSynchronize(s);
+        };
+        // in set order: runs of lighter experts through MMQ (run_set over the run), the heavy ones through cuBLAS
         const auto run_set_q = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                    int r0) {
+            if (!batch_f16) {
+                for (int i = 0; i < n_exp;) {
+                    const int rows = hb[i + 1] - hb[i];
+                    if (rows >= blas_rows) {
+                        run_blas_q(wbase + (size_t) i * stride, hb[i], rows, r0);
+                        ++i;
+                    } else {
+                        int j = i + 1;
+                        while (j < n_exp && hb[j + 1] - hb[j] < blas_rows) ++j;
+                        run_set(wbase + (size_t) i * stride, j - i, stride, d_bounds + i, hb + i, r0);
+                        i = j;
+                    }
+                }
+                return;
+            }
+            std::vector<BItem> batch;
+            const auto flush_batch = [&] {
+                if (batch.empty()) return;
+                run_blas_batch(batch, r0);
+                batch.clear();
+            };
             for (int i = 0; i < n_exp;) {
                 const int rows = hb[i + 1] - hb[i];
-                if (rows >= blas_rows) {
+                if (rows >= blas_rows && rows <= kRowCap) {
+                    static const int kBn = [] {
+                    const char* v = getenv("MAYA_GLM_PREFILL_BATCH_N");
+                    const int n = v != nullptr ? std::atoi(v) : 0;
+                    return n > 0 ? std::min(n, 32) : 0;
+                }();
+                const int cap = (kBn > 0 ? kBn : kB);
+                if (!batch.empty() &&
+                    (int) batch.size() >= cap) flush_batch();
+                    batch.push_back({wbase + (size_t) i * stride, hb[i], rows});
+                    ++i;
+                } else if (rows > kRowCap) {   // too many rows for the padded staging: the single-expert product
+                    flush_batch();
                     run_blas_q(wbase + (size_t) i * stride, hb[i], rows, r0);
                     ++i;
                 } else {
                     int j = i + 1;
                     while (j < n_exp && hb[j + 1] - hb[j] < blas_rows) ++j;
+                    flush_batch();
                     run_set(wbase + (size_t) i * stride, j - i, stride, d_bounds + i, hb + i, r0);
                     i = j;
                 }
             }
+            flush_batch();
         };
         const auto run_set_x3 = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                     int r0) { x3_run_set(x3l, wbase, n_exp, stride, d_bounds, hb, r0); };

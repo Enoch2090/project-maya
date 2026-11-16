@@ -94,7 +94,18 @@ ggml_cuda_device_info & cuda_info_mut() {
             d.smpb = prop.sharedMemPerBlock;
             d.vmm = false;
             d.total_vram = prop.totalGlobalMem;
+#if defined(STRATA_USE_MUSA)
+            // The device code is compiled for MUSA's logical 32-lane warp (common.cuh's
+            // ggml_cuda_get_physical_warp_size() is a compile-time 32), but the driver reports the hardware
+            // warp width - 128 on MTT S4000.  The MMQ launch geometry derives its block shape from this
+            // number: nwarps = nthreads / warp_size and block_dims = (warp_size, nwarps), so 128 gave
+            // block_dims (128, 2) where the device expects (32, 8) and the tiles' row mapping came out
+            // wrong - the kernel wrote only a prefix of its output rows (rows 1-2 exact, 4 rows already 40%
+            // untouched).  Reporting 32 puts host and device on the same warp.
+            d.warp_size = 32;
+#else
             d.warp_size = prop.warpSize;
+#endif
             d.physical_device = id;
             d.physical_share_count = 1;
             d.virtual_index = 0;
