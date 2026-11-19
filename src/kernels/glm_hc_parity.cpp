@@ -360,7 +360,7 @@ void test_fast_fixture() {
     a.comb = take(H * H * sizeof(float));
     a.x = take(E * sizeof(float));
     a.xq = take(E * 2); // q8_1: 36 bytes per 32 elements
-    a.part = take((26 * E / 128 + 64) * sizeof(float));
+    a.part = take(fast::hc_part_floats(E) * sizeof(float));
     a.counter = (unsigned int*) take(64);
     check(cudaMemset(a.counter, 0, 64), "fast HC counter");
     const float* d_block = upload_values(block);

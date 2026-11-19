@@ -8,8 +8,8 @@ Measured on 4× MTT S4000 48 GB (MUSA 5.2.0, driver 5.2.0, mcc 5.2.0 = clang 14)
 
 | | |
 |---|---|
-| **Decode** | **17.1 tok/s** single stream (mean of three greedy 256-token answers: 17.00 / 15.95 / 18.39; 59–65 ms/token) with the DFlash2 drafter (`--dflash … --spec 5`) |
-| **Prefill** | **251 tok/s** at an 8K prompt (32.6 s), 131 tok/s at 2K - the FP16 expert products over RAI/muBLAS with whole-chunk sub-batches (see Known limits for what still bounds it) |
+| **Decode** | **20.8 tok/s** single stream at a short prompt (48.1 ms/token), **16.5 tok/s at a 128K context** (60.5 ms/token) - with the DFlash2 drafter (`--dflash … --spec 5`) |
+| **Prefill** | **1091 tok/s at 128K** (120.1 s), 845 at 32K - the FP16 expert products over muBLAS, six chunks of 5504 tokens pipelined across the four cards; `docs/musa/perf/ROUNDS.md` has the campaign that got there |
 | Start | ~40 s to `READY` (97.6 GB of weights read from NVMe at 5.5–6 GB/s per card) |
 
 ## What the port adds
