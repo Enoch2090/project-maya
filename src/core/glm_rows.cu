@@ -143,7 +143,7 @@ bool Glm5Model::rows_alloc(std::string& err) {
             for (auto& p : S->kconv) p = f32(DI);
             S->kg1 = f32(DI);
             S->kg2 = f32(DI);
-            S->hc_part_n = (4 * E / 512) * 26 + 64;   // (as the token path's F->part)
+            S->hc_part_n = gf::hc_part_floats((int) E);   // (as the token path's F->part)
             S->hc_part = f32(S->hc_part_n);
             S->hc_ctr = take(64);
         }

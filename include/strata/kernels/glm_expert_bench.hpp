@@ -10,7 +10,8 @@ namespace strata::kernels::glmf::hip_expert_bench {
 enum class Variant {
     baseline, production, signs, waves8, rows2, rows8, global_grid, global_plain,
     global_waves8, global_rows2, global_rows8, split_shared, direct_signs,
-    vector_load, occupancy8, direct_lds, direct_rows4, direct_lds_rows4
+    vector_load, occupancy8, direct_lds, direct_rows4, direct_lds_rows4,
+    fused_shared32
 };
 void gate_up(Variant variant, int type, const MoeDev& d, int k, int n_embd, int n_ff,
              float limit, const void* xq, void* hq, const void* sh_down, int sh_type,

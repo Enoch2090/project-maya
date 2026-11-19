@@ -831,6 +831,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->timing = getenv("MAYA_GLM_TIMING") != nullptr;
     F->prof_on = getenv("MAYA_GLM_PROF") != nullptr;
     if (F->prof_on) F->pskip = (uint64_t) std::max(0, std::atoi(getenv("MAYA_GLM_PROF")));
+    if (F->prof_on) F->prof_dev = dev_;   // MAYA_GLM_R63_STAGE: the ledger's key for this part's stages
     if (const char* pn = getenv("MAYA_GLM_PREFETCH_N")) {
         F->max_pf = std::max(0, std::min(gf::kSpares - 1, std::atoi(pn)));
         if (F->max_pf > 0 && getenv("MAYA_GLM_PF_CE") != nullptr && std::atoi(getenv("MAYA_GLM_PF_CE")) != 0) {
@@ -1058,7 +1059,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->pre = fa_take(at, 8);
     F->post = fa_take(at, 8);
     F->comb = fa_take(at, 16);
-    F->part = fa_take(at, (size_t) (4 * E / 512) * 26 + 64);   // 25 partials per block + the norm's per-block sums
+    F->part = fa_take(at, gf::hc_part_floats((int) E));   // the mix rows, the sum of squares and hc3's Gram rows
     F->counter = (unsigned int*) fa_take_b(at, 64);
     F->xq = fa_take_b(at, (size_t) E / 32 * q8);
     for (int i = 0; i < 3; ++i) F->proj[i] = fa_take(at, DI);
@@ -4677,6 +4678,73 @@ void Glm5Model::fast_destroy() {
         for (auto& e : v)
             std::fprintf(stderr, "  %-18s %7.3f ms/token  %5.1f%%\n", e.second.c_str(), e.first / (double) F->ptokens,
                          100.0 * e.first / tot);
+        // MAYA_GLM_R63_STAGE: the same stages' GEMV weight bytes and types - the stage -> type -> bytes table
+        if (gf::stage_ledger_on()) {
+            // MAYA_GLM_R63_STAGE: the stage -> type -> bytes -> ms table.  A row's BYTES and MS come from the same
+            // launches (the ledger's own event chain), so the GB/s is a bandwidth this card can reach - that pairing
+            // was the whole point of the exercise: R50's table divided index bytes by prof times taken from another
+            // stage entirely, and an impossible 265 GB/s against a 769 GB/s card was never the kernel's number.
+            struct Row {
+                std::string stage;
+                int type = 0, ncol = 0;
+                uint64_t jobs = 0, passes = 0;
+                double bytes = 0, ms = 0;
+                int64_t n_in = 0, n_out = 0;
+            };
+            std::vector<Row> rows;
+            uint64_t ltokens = 0;
+            gf::stage_ledger_get(
+                dev_,
+                [](void* c, const char* stage, int type, int ncol, uint64_t jobs, double bytes, uint64_t passes,
+                   int64_t n_in, int64_t n_out, double ms) {
+                    static_cast<std::vector<Row>*>(c)->push_back(Row{stage, type, ncol, jobs, passes, bytes, ms, n_in,
+                                                                    n_out});
+                },
+                &rows, &ltokens);
+            const double ntok = (double) std::max<uint64_t>(1, ltokens);
+            // A stage's ms is ONE number covering every type it read (the interval between two marks), so the rows of
+            // one stage are shown together under a per-stage total: a per-(stage,type) GB/s would divide one type's
+            // bytes by the whole stage's ms (and the stage's ms again for the next type, which is how a single stage
+            // appeared to run at three times the card's peak).  The type split is what this table is for; the GB/s is
+            // the stage's.
+            std::map<std::string, std::pair<double, double>> by_stage;   // stage -> bytes, ms
+            for (const auto& r : rows) {
+                auto& v = by_stage[r.stage];
+                v.first += r.bytes;
+                if (r.ms > v.second) v.second = r.ms;   // (the same for every type of the stage: max is that)
+            }
+            std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+                return a.bytes != b.bytes ? a.bytes > b.bytes : a.stage < b.stage;
+            });
+            double tot_bytes = 0.0, tot_ms = 0.0;
+            for (const auto& kv : by_stage) {
+                tot_bytes += kv.second.first;
+                tot_ms += kv.second.second;
+            }
+            const double tmb = tot_bytes / ntok / 1e6, tms = tot_ms / ntok;
+            std::fprintf(stderr,
+                         "glm fast gemv ledger CUDA%d (%llu tokens, %.1f MB/token of weight rows, %.2f ms/token of "
+                         "the ledger's own intervals, %.1f GB/s of it):\n", dev_, (unsigned long long) ltokens, tmb, tms,
+                         tms > 0.0 ? tmb / tms : 0.0);
+            std::string last;
+            for (const auto& r : rows) {
+                const double mb = r.bytes / ntok / 1e6;
+                const double ms = r.ms / ntok;
+                if (r.stage != last) {
+                    last = r.stage;
+                    const auto& st = by_stage[r.stage];
+                    const double sms = st.second / ntok, smb = st.first / ntok / 1e6;
+                    std::fprintf(stderr,
+                                 "  %-18s %8.3f ms/token  %8.1f MB/token  %6.1f GB/s  %5.1f%% of the card's stream\n",
+                                 r.stage.c_str(), sms, smb, sms > 0.0 ? smb / sms : 0.0,
+                                 100.0 * r.ms / std::max(1e-9, tot_ms));
+                }
+                std::fprintf(stderr, "      type %-3d (%-4s) nc=%-3d jobs=%-8llu %8.1f MB\n", r.type,
+                             r.type == 30 ? "BF16" : r.type == 14 ? "Q6_K" : r.type == 16 ? "IQ2_XXS" : r.type == 12
+                                     ? "Q4_K" : r.type == 22 ? "IQ2_S" : r.type == 18 ? "IQ3_XXS" : "?",
+                             r.ncol, (unsigned long long) r.jobs, mb);
+            }
+        }
     }
     for (auto e : F->pev) cudaEventDestroy(e);
     if (snap_pool_) {
@@ -6910,6 +6978,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
+    if (FT->prof_on) FT->mark("head_mv");
     gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, FT->tok, FT->cs);
     cudaMemcpyAsync(FT->tok_h, FT->tok, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
     cudaEventRecord(FT->ev_done, FT->cs);
@@ -7752,6 +7821,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
             err = "glm spec: output head";
             return false;
         }
+        if (m->fast_->prof_on) m->fast_->mark("head_mv");
         enqueue_pick(m, FL);
         cudaSetDevice(dev_);
         return true;
@@ -7765,6 +7835,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
         err = "glm spec: output head";
         return false;
     }
+    if (F->prof_on) F->mark("head_mv");
     enqueue_pick(this, F);
     if (sprof) {
         cudaEventRecord(spec_ev_[1], F->cs);
@@ -7896,6 +7967,7 @@ bool Glm5Model::spec_tail_back(Glm5Model* head, int64_t p, std::string& err) {
         err = "glm spec: output head";
         return false;
     }
+    if (m->fast_->prof_on) m->fast_->mark("head_mv");
     gf::argmax(m->sc_ + m->sc_logits, g.n_vocab, FL->tok, FL->cs);
     cudaMemcpyAsync(FL->tok_h, FL->tok, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
     cudaEventRecord(FL->ev_done, FL->cs);

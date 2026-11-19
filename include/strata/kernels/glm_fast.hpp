@@ -84,6 +84,28 @@ int launch_errors();
 /// Bytes of one row of `type` with n_in values (0 when unsupported).
 size_t row_bytes(int type, int64_t n_in);
 
+/// MAYA_GLM_R63_STAGE: the GEMV ledger (debug only, off unless the variable is set).
+/// R62 measured which (type, columns) the decode's GEMV jobs are but mv() takes no stage name; this ledger gives
+/// every mv() / moe_gate_up() / moe_down() / moe_experts_multi() call a stage, by having the stage profiler's mark()
+/// flush the launches it has just closed under the name it is closing.  The names are then the prof table's own.
+bool stage_ledger_on();
+/// One call's weight bytes: jobs rows-blocks of `type` against n_in inputs, n_out rows each.
+void stage_ledger_note(int type, int ncol, int64_t n_in, int64_t n_out, uint64_t jobs);
+/// The launching thread's calls on `device` since the last flush, added under `name` ("unattributed": nullptr), and
+/// the interval that ends here (an event on `s`) credited to the same stage: a row's bytes and ms always describe
+/// the same launches, so bytes/ms is a bandwididth this machine can actually reach.
+/// (The device is the one the caller set: a split's parts are enqueued from one thread, one device at a time.)
+void stage_ledger_flush(int device, cudaStream_t s, const char* name);
+/// The launching thread's calls since the last flush, dropped (a token's first segment: the profiler skips it too).
+void stage_ledger_discard();
+/// The token's per-stage sums into the device's totals (keep false: the token's first n are left out, as the prof)
+void stage_ledger_commit(int device, cudaStream_t s, bool keep);
+/// The device's totals: cb once a (stage, type, columns) triple.
+void stage_ledger_get(int device,
+                      void (*cb)(void* ctx, const char* stage, int type, int ncol, uint64_t jobs, double bytes,
+                                 uint64_t passes, int64_t n_in, int64_t n_out, double ms),
+                      void* ctx, uint64_t* tokens);
+
 /// q8_1 of n floats (n % 32 == 0).
 void quantize_q8_1(const float* x, void* xq, int n, cudaStream_t s);
 
@@ -110,11 +132,23 @@ struct HcArgs {
     int iters = 20, n_embd = 4096;
     float* x = nullptr;               // n_embd f32
     void* xq = nullptr;               // n_embd / 32 q8_1 blocks
-    float* part = nullptr;            // scratch: (hc*n_embd / 512) * 25 floats
+    float* part = nullptr;            // scratch: hc_part_floats(n_embd) floats - see hc_part_rows()
     unsigned int* counter = nullptr;  // zero-initialised once: the single-tail kernel leaves it zero; the grid-
                                       // barrier kernels (hc2 / hc3) only count it up - each barrier waits for the
                                       // next multiple of the block count, so it needs no reset
 };
+/// Rows of partials hc's grid-barrier kernels publish per block, and the float count `part` needs.
+/// hc3 uses hc_part_rows(n_embd) rows of (hc*n_embd/512) blocks; hc2 uses 25 of 26, hc_kernel 25.
+/// Layout: row m of n blocks lives at part[m * n + block], m < HC_MIX = 24 are the mix rows, 24 is the
+/// sum of squares of R, and hc3's 10 Gram rows follow.  The single-tail hc_kernel stores block-major
+/// (part[block * 25 + m]) inside the same buffer, so the allocation must cover the larger of the two.
+constexpr int hc_part_rows(int n_embd) { return 25 + 10 + 1; }   // 24 mix + sum of squares + 10 Gram
+inline size_t hc_part_floats(int n_embd) {
+    const size_t blocks = (size_t) (4 * n_embd / 512);
+    const size_t row_major = blocks * (size_t) hc_part_rows(n_embd);
+    const size_t block_major = blocks * 26;   // hc_kernel / hc2_kernel's own striding
+    return (row_major > block_major ? row_major : block_major) + 64;
+}
 void hc(const HcArgs& a, cudaStream_t s);
 /// n rows' hc (each its own args, partials and counter) in one launch where the grid-barrier kernel can hold them all
 /// resident (n <= kMaxMvNt), else one launch a row; each row runs hc3's block function on its own args, so its

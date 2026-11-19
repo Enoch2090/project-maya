@@ -32,6 +32,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>   // glm-dsa: std::memcpy for glmd_mv_dots.cuh's host path (included below, inside the namespace)
+#include <map>       // MAYA_GLM_R63_STAGE's ledger
+#include <mutex>
 #include <string>
 
 #if defined(STRATA_USE_HIP)
@@ -786,17 +788,33 @@ __device__ __forceinline__ void load_tab(uint32_t* s_tab) {
 // q8_1 block (index kbx * qk/32 + k % ipb) and all 8 of its ints
 struct XV {
     int u[8];
+    int su[8];   // (SU) each word's four unsigned bytes summed: S(x^0x80808080), for dp4a_bias
     float d, s;
 };
+// SU: also the unsigned-byte sums the bias form of a signed dot needs (IQ2_XXS only; the other types read only u)
+template<bool SU = false>
 __device__ __forceinline__ XV load_xv(const block_q8_1* xb) {
     XV v;
     const int* q = (const int*) xb->qs;
 #pragma unroll
     for (int i = 0; i < 8; ++i) v.u[i] = q[i];
+    if constexpr (SU) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) v.su[i] = (int) __dp4a((unsigned) q[i] ^ 0x80808080u, 0x01010101u, 0u);
+    }
     const float2 ds = __half22float2(xb->ds);
     v.d = ds.x;
     v.s = ds.y;
     return v;
+}
+// the signed bytes a and b on this device: __dp4a(int) builds an int4 (4 extracts + 4 sign extends) and then DOT8.
+// __dp4a(unsigned) hands the two words to DOT8 directly.  s(v) = u(v) - 128 a byte, so
+//   sum s(a)s(b) = dot_u(a^0x80, b^0x80) - 128*S(a^0x80) - 128*S(b^0x80) + 65536
+// (xor flips the sign bit, no carry between bytes).  S(b^0x80) is a row's own business (SU above), S(a^0x80) is one
+// more word dot.  All integer: the same int32, bit for bit (R55 verified 0 of 49152 mismatches).
+__device__ __forceinline__ int dp4a_bias(unsigned a, unsigned b, int sxu) {
+    const unsigned au = a ^ 0x80808080u;
+    return (int) __dp4a(au, b ^ 0x80808080u, 0u) - 128 * (int) __dp4a(au, 0x01010101u, 0u) - 128 * sxu + 65536;
 }
 template<int T> __device__ __forceinline__ float dw(const uint8_t* row, int kbx, int iqs, const XV& x, const uint32_t* tab);
 template<> __device__ __forceinline__ float dw<19>(const uint8_t* row, int kbx, int iqs, const XV& x, const uint32_t* tab) {
@@ -1176,8 +1194,8 @@ template<> __device__ __forceinline__ float dw_rdna<16>(const uint8_t* row, int 
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
         const uint4 signs = direct ? direct_signs(aux32 >> (7 * k0 / 2), true) : sign_tab[(aux32 >> (7 * k0 / 2)) & 127];
-        sumi = __dp4a((int) ((grid_pos.x ^ signs.x) + signs.y), x.u[k0 + 0], sumi);
-        sumi = __dp4a((int) ((grid_pos.y ^ signs.z) + signs.w), x.u[k0 + 1], sumi);
+        sumi += dp4a_bias((unsigned) ((grid_pos.x ^ signs.x) + signs.y), (unsigned) x.u[k0 + 0], x.su[k0 + 0]);
+        sumi += dp4a_bias((unsigned) ((grid_pos.y ^ signs.z) + signs.w), (unsigned) x.u[k0 + 1], x.su[k0 + 1]);
     }
     const int ls = aux32 >> 27 | 1;
     sumi = sumi * ls / 8;
@@ -1219,14 +1237,14 @@ template<> __device__ __forceinline__ float dw_rdna<22>(const uint8_t* row, int 
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)];
         const uint4 signs = direct ? direct_signs(signs_packed_8[l0 / 2], false) : sign_tab[signs_packed_8[l0 / 2]];
-        const int grid_l = ((grid_pos.x ^ signs.x) + signs.y);
-        const int grid_h = ((grid_pos.y ^ signs.z) + signs.w);
+        const unsigned grid_l = (unsigned) ((grid_pos.x ^ signs.x) + signs.y);
+        const unsigned grid_h = (unsigned) ((grid_pos.y ^ signs.z) + signs.w);
         if (l0 < 4) {
-            sumi0 = __dp4a(grid_l, x.u[l0 + 0], sumi0);
-            sumi0 = __dp4a(grid_h, x.u[l0 + 1], sumi0);
+            sumi0 += dp4a_bias(grid_l, (unsigned) x.u[l0 + 0], x.su[l0 + 0]);
+            sumi0 += dp4a_bias(grid_h, (unsigned) x.u[l0 + 1], x.su[l0 + 1]);
         } else {
-            sumi1 = __dp4a(grid_l, x.u[l0 + 0], sumi1);
-            sumi1 = __dp4a(grid_h, x.u[l0 + 1], sumi1);
+            sumi1 += dp4a_bias(grid_l, (unsigned) x.u[l0 + 0], x.su[l0 + 0]);
+            sumi1 += dp4a_bias(grid_h, (unsigned) x.u[l0 + 1], x.su[l0 + 1]);
         }
     }
     const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
@@ -1246,7 +1264,7 @@ __device__ __forceinline__ void rows_dot_rdna(const uint8_t* const* rows, const 
                                              const uint4* signs, float* s, bool direct = false, bool wide = false) {
     float acc[NR] = {};
     for (int k = lane; k < n_in / 32; k += 32) {
-        const XV xv = load_xv(x + k);
+        const XV xv = load_xv<T == 16 || T == 22>(x + k);
 #pragma unroll
         for (int r = 0; r < NR; ++r)
             acc[r] += dw_rdna<T>(rows[r], k / 8, 2 * (k % 8), xv, tab, signs, direct, wide);
@@ -2158,14 +2176,23 @@ __global__ void __launch_bounds__(256) mvc_kernel_bf16(const STRATA_GRID_CONSTAN
 // of __vsubss4's ten-instruction SWAR emulation (q - 32 never saturates: sum (q - 32) u = sum q u + sum (-32) u, both
 // exact in v_dot4_i32_iu8).  Every row's value is still dot_q6_K's arithmetic in row_dot's order - lane L takes iqs L
 // of every super-block, the blocks in order, then warp_sum - so the outputs are bit for bit mv_kernel_t's.
+// (R60) The dp4a bias: each loaded word also carries its byte sum, which is a (row,super-block) or
+// (column,super-block) invariant - q6_wload / q6_xload run once per such pair, so the sum is hoisted out of the
+// column / row loop for free.  q0/q1 are the two 6-bit quants q6_val used to rebuild from vl/vh.
 struct Q6W {   // one lane's share of one Q6_K super-block (dot_q6_K's loads)
     int vl, vh, sc0, sc1;
+    int q0, q1, sq0, sq1;   // the two quant words and their byte sums (row x super-block)
     float d;
 };
 struct Q6X {   // ... and of the q8_1 activation blocks it meets
     int u0, u1;
+    int w0, w1, su0, su1;   // u^0x80 and its byte sums (column x super-block)
     float d0, d1;
 };
+// (R60) sum of four byte values, exact.  The multiply form is only exact while the bytes sum to < 256: q's bytes
+// are 6-bit (max 252), so it is used there; u^0x80 reaches 255 (max 1020) and takes the one-dot form instead.
+__device__ __forceinline__ int q6_bsum6(int q) { return (int) (((unsigned) q * 0x01010101u) >> 24); }
+__device__ __forceinline__ int q6_bsum8(int w) { return (int) __dp4a((unsigned) w, 0x01010101u, 0u); }
 __device__ __forceinline__ Q6W q6_wload(const block_q6_K* w, int lane) {
     Q6W r;
     r.vl = get_int_b2(w->ql, lane);
@@ -2173,6 +2200,10 @@ __device__ __forceinline__ Q6W q6_wload(const block_q6_K* w, int lane) {
     const int8_t* sc = w->scales + 8 * (lane / 16) + (lane % 16) / 4;
     r.sc0 = sc[0];
     r.sc1 = sc[4];
+    r.q0 = (r.vl & 0x0f0f0f0f) | ((r.vh << 4) & 0x30303030);
+    r.q1 = ((r.vl >> 4) & 0x0f0f0f0f) | (r.vh & 0x30303030);
+    r.sq0 = q6_bsum6(r.q0);
+    r.sq1 = q6_bsum6(r.q1);
     r.d = __half2float(w->d);
     return r;
 }
@@ -2182,24 +2213,34 @@ __device__ __forceinline__ Q6X q6_xload(const block_q8_1* x, int lane) {   // x:
     r.u0 = ((const int*) b[0].qs)[lane % 8];
     r.d0 = __low2float(b[0].ds);
     r.u1 = ((const int*) b[2].qs)[lane % 8];
+    r.w0 = r.u0 ^ 0x80808080;
+    r.w1 = r.u1 ^ 0x80808080;
+    r.su0 = q6_bsum8(r.w0);
+    r.su1 = q6_bsum8(r.w1);
     r.d1 = __low2float(b[2].ds);
     return r;
 }
-// sum (q_i - 32) u_i for four 6-bit q: __dp4a(__vsubss4(q, 0x20202020), u, 0) without the SWAR subtract
-__device__ __forceinline__ int q6_idot(int q, int u) {
+// sum (q_i - 32) s(u_i) for four 6-bit q and four signed u.
+//   s(u) = (u ^ 0x80) - 128  =>  sum (q-32) s(u) = dot_u(q, u^0x80) - 128*S(q) - 32*S(u^0x80) + 16384
+// The unsigned overload of __dp4a calls __musa_dot8_u32 directly; the int one builds two int4 vectors first
+// (mp_ext_61_intrinsics.hpp, __MUSA_ARCH__ 220).  S(q) and S(u^0x80) are the hoisted byte sums.  Exact in int.
+__device__ __forceinline__ int q6_idot(int q, int w, int sq, int sw) {
 #if __has_builtin(__builtin_amdgcn_sudot4) && (defined(__gfx1100__) || defined(__gfx1101__) || \
     defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__))
-    return __builtin_amdgcn_sudot4(true, (int) 0xe0e0e0e0u, true, u, __builtin_amdgcn_sudot4(false, q, true, u, 0, false),
-                                   false);
+    // that target has a real sudot4 and the original expression is right there: keep it verbatim
+    (void) sq; (void) sw;
+    const int u = w ^ 0x80808080;   // back to the signed activation word
+    return __builtin_amdgcn_sudot4(true, (int) 0xe0e0e0e0u, true, u,
+                                   __builtin_amdgcn_sudot4(false, q, true, u, 0, false), false);
 #else
-    return __dp4a((int) __vsubss4(q, 0x20202020), (int) u, 0);   // (the casts pick the int overload)
+    return (int) __dp4a((unsigned) q, (unsigned) w, 0u) - 128 * sq - 32 * sw + 16384;
 #endif
 }
 // dot_q6_K's float arithmetic, term for term (the same products, sums and order)
 __device__ __forceinline__ float q6_val(const Q6W& w, const Q6X& x) {
     float sumf = 0.0f;
-    sumf += x.d0 * (q6_idot((w.vl & 0x0f0f0f0f) | ((w.vh << 4) & 0x30303030), x.u0) * w.sc0);
-    sumf += x.d1 * (q6_idot(((w.vl >> 4) & 0x0f0f0f0f) | (w.vh & 0x30303030), x.u1) * w.sc1);
+    sumf += x.d0 * (q6_idot(w.q0, x.w0, w.sq0, x.su0) * w.sc0);
+    sumf += x.d1 * (q6_idot(w.q1, x.w1, w.sq1, x.su1) * w.sc1);
     return w.d * sumf;
 }
 // R weight rows (rb bytes apart) x NT activations (xs q8_1 blocks apart), nb super-blocks, U of them per step
@@ -2336,6 +2377,21 @@ __global__ void quantize_kernel(const float* __restrict__ x, block_q8_1* __restr
 constexpr int HC_CHUNK = 512;
 constexpr int HC_THREADS = 256;
 constexpr int HC_MIX = 24;      // (2 + hc) * hc for hc = 4
+// hc3's phase 3 needs sum over the WHOLE grid of mixed[e]^2, and mixed[e] = sum_s pre[s] R[s][e], so that
+// total is sum_{s,s'} pre[s] pre[s'] G[s][s'] with G[s][s'] = sum_e R[s][e] R[s'][e].  G depends only on R,
+// which phase 1 already has, so each block publishes its own lower-triangular contribution (10 entries) in
+// the same grid barrier the 24 mix rows use - and hc3's SECOND barrier disappears.  Arithmetic is unchanged
+// (same sums, different association); glm_hc_parity and glm_rows_kernels_test pin the result.
+constexpr int HC_G = 10;        // the 4x4 Gram's lower triangle, for hc = 4
+// k-th entry of that lower triangle, in row-major order: 0 (0,0) 1 (0,1) 2 (0,2) 3 (0,3) 4 (1,1)
+// 5 (1,2) 6 (1,3) 7 (2,2) 8 (2,3) 9 (3,3).  Arithmetic, not a table: a runtime-indexed local
+// array would land in local memory inside a kernel this register-tight.
+__device__ __forceinline__ void hc_gtri(int k, int& ga, int& gb) {
+    int rem = k, a = 0;
+    if (rem >= 4) { rem -= 4; a = 1; if (rem >= 3) { rem -= 3; a = 2; if (rem >= 2) { rem -= 2; a = 3; } } }
+    ga = a;
+    gb = a + rem;
+}
 
 __global__ void __launch_bounds__(HC_THREADS) hc_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
     const int hc = 4;
@@ -2588,7 +2644,7 @@ __device__ __forceinline__ void hc3_block(const HcArgs& a, const unsigned int nb
     unsigned long long* ctr = (unsigned long long*) a.counter;
     __shared__ float sR[4][HC2_EB];
     __shared__ float sred[32];
-    __shared__ float smix[HC_MIX + 1];
+    __shared__ float smix[HC_MIX + 1 + HC_G];
     __shared__ float s_pre[4];
     __shared__ float s_mixed[HC2_EB];
     // the weights first: warp w owns mix rows w, w + 8, w + 16; per row and stream segment d a lane loads the 4 bf16
@@ -2635,9 +2691,19 @@ __device__ __forceinline__ void hc3_block(const HcArgs& a, const unsigned int nb
     }
     ss = block_sum(ss, sred);
     if (tid == 0) part[(size_t) HC_MIX * nb + b] = ss;
+    // this block's Gram contribution: one warp per entry (8 warps cover 10 in two passes), over the
+    // segment already in sR - no extra __syncthreads, no extra pass over memory
+    for (int k = warp; k < HC_G; k += 8) {
+        int ga = 0, gb = 0;
+        hc_gtri(k, ga, gb);
+        float gt = 0.0f;
+        for (int i = lane; i < HC2_EB; i += 32) gt += sR[ga][i] * sR[gb][i];
+        gt = warp_sum(gt);
+        if (lane == 0) part[(size_t) (HC_MIX + 1 + k) * nb + b] = gt;
+    }
     grid_barrier(ctr, nb);
     // the 25 totals: warp w reduces rows w, w + 8, w + 16 (and warp 0 row 24), one partial per lane
-    for (int m = warp; m < HC_MIX + 1; m += 8) {
+    for (int m = warp; m < HC_MIX + 1 + HC_G; m += 8) {
         const float v = lane < (int) nb ? __ldcg(&part[(size_t) m * nb + lane]) : 0.0f;
         const float t = warp_sum(v);
         if (lane == 0) smix[m] = t;
@@ -2677,19 +2743,22 @@ __device__ __forceinline__ void hc3_block(const HcArgs& a, const unsigned int nb
         if (b == 0 && lane < 16) a.comb[d * hc + s] = c;
     }
     __syncthreads();
-    float ss2 = 0.0f;
     if (tid < HC2_EB) {
         float acc = 0.0f;
 #pragma unroll
         for (int s = 0; s < hc; ++s) acc += s_pre[s] * sR[s][tid];
         s_mixed[tid] = acc;
-        ss2 = acc * acc;
     }
-    ss2 = block_sum(ss2, sred);
-    float* part2 = a.part + (size_t) (HC_MIX + 1) * nb;
-    if (tid == 0) part2[b] = ss2;
-    grid_barrier(ctr, nb);
-    const float tot = warp_sum(lane < (int) nb ? __ldcg(&part2[lane]) : 0.0f);
+    // ---- phase 3's total, without the second grid barrier: mixed^2 summed over the grid is
+    // sum_{s,s'} pre[s] pre[s'] G[s][s'], and every G[s][s'] was published before the first barrier.
+    float tot = 0.0f;
+#pragma unroll
+    for (int k = 0; k < HC_G; ++k) {
+        int ga = 0, gb = 0;
+        hc_gtri(k, ga, gb);
+        const float wgt = ga == gb ? 1.0f : 2.0f;   // the off-diagonal entries appear twice
+        tot += wgt * s_pre[ga] * s_pre[gb] * smix[HC_MIX + 1 + k];
+    }
     const float inv2 = rsqrtf(tot / (float) n_embd + a.norm_eps);
     if (tid < HC2_EB) {
         const int e = e0 + tid;
@@ -5495,6 +5564,172 @@ size_t row_bytes(int type, int64_t n_in) {
     }
 }
 
+// ---------------------------------------------------------------- MAYA_GLM_R63_STAGE: the stage -> type -> bytes ledger
+// R62 measured which (type, columns) the decode's GEMV jobs are, but mv() takes no stage name, so "which stage reads
+// which type" was never answered - and R50 answered it wrongly (it put type 14's bytes on type 8's account).  This
+// ledger closes that: every mv() / moe_gate_up() / moe_down() / moe_experts_multi() call records (type, columns,
+// weight bytes) into the calling thread's open buffer, and stage_ledger_flush() - which the stage profiler's mark()
+// calls with the name it is closing - moves that buffer under that stage name.  The stage names are therefore, by
+// construction, the prof table's own names; no call site had to be renamed.
+namespace {
+struct LedgerKey {
+    int type = 0, ncol = 0;
+    bool operator<(const LedgerKey& o) const { return type != o.type ? type < o.type : ncol < o.ncol; }
+};
+struct LedgerVal {
+    uint64_t jobs = 0;
+    double bytes = 0;
+    uint64_t passes = 0;           // the speculative passes this stage's launches appeared in
+    int64_t n_in = 0, n_out = 0;   // the last job's shape (the arithmetic's check: row_bytes(type, n_in) * n_out)
+};
+using LedgerMap = std::map<LedgerKey, LedgerVal>;
+// one thread's open buffer (the launches since the last mark) and the current token's per-stage sums, per DEVICE
+thread_local std::map<int, LedgerMap> t_cur;
+thread_local std::map<int, std::map<std::string, LedgerMap>> t_tok;
+// each device's event chain (the prof's mechanism: the interval ending at a flush belongs to the stage it names)
+struct LedgerEvents {
+    std::vector<cudaEvent_t> ev;
+    std::vector<const char*> ev_name;   // the stage each recorded event closes
+    size_t n = 0;
+};
+thread_local std::map<int, LedgerEvents> t_ev;
+thread_local std::map<int, std::map<std::string, double>> t_time;   // stage -> ms of this token
+struct LedgerTotal {
+    std::map<std::string, LedgerMap> stage;          // stage -> (type, ncol) -> jobs, bytes
+    std::map<std::string, double> ms;                // stage -> this device's ms over the counted tokens
+    uint64_t tokens = 0;
+};
+std::mutex g_led_mu;
+std::map<int, LedgerTotal> g_led;   // device -> totals
+}  // namespace
+
+bool stage_ledger_on() {
+    static const bool on = getenv("MAYA_GLM_R63_STAGE") != nullptr;
+    return on;
+}
+
+void stage_ledger_note(int type, int ncol, int64_t n_in, int64_t n_out, uint64_t jobs) {
+    if (!stage_ledger_on() || jobs == 0 || n_out <= 0) return;
+    const size_t rb = row_bytes(type, n_in);
+    if (rb == 0) return;
+    int dev = 0;   // the device the caller set: a split's parts are enqueued from one thread, one device at a time
+    if (cudaGetDevice(&dev) != cudaSuccess) return;
+    LedgerVal& v = t_cur[dev][LedgerKey{type, ncol}];
+    v.jobs += jobs;
+    // the weight rows: n_out rows of them, `jobs` times over (an mv() call is one job; a MoE launch is one a routed
+    // expert), each row read once whatever the column count
+    v.bytes += (double) rb * (double) n_out * (double) jobs;
+    v.n_in = n_in;
+    v.n_out = n_out;
+}
+
+void stage_ledger_flush(int device, cudaStream_t s, const char* name) {
+    if (!stage_ledger_on()) return;
+    // mark this stage's end: the event is recorded now, its interval summed in commit() after the stream's sync
+    {
+        LedgerEvents& E = t_ev[device];
+        if (E.n >= E.ev.size()) {
+            cudaEvent_t e = nullptr;
+            cudaEventCreate(&e);
+            E.ev.push_back(e);
+            E.ev_name.push_back(nullptr);
+        }
+        cudaEventRecord(E.ev[E.n], s);
+        E.ev_name[E.n] = name;
+        ++E.n;
+    }
+    auto it = t_cur.find(device);
+    if (it == t_cur.end() || it->second.empty()) return;
+    LedgerMap& dst = t_tok[device][name != nullptr ? name : "unattributed"];
+    for (const auto& kv : it->second) {
+        LedgerVal& d = dst[kv.first];
+        d.jobs += kv.second.jobs;
+        d.bytes += kv.second.bytes;
+        d.passes += 1;   // this stage had launches in one more pass
+        d.n_in = kv.second.n_in;
+        d.n_out = kv.second.n_out;
+    }
+    t_cur.erase(it);
+}
+
+void stage_ledger_discard() {
+    t_cur.clear();
+    // ... and the sums the skipped token's marks already flushed: without this they stay in t_tok and are committed
+    // with the first counted token, so N skipped tokens' bytes land over 1 token's divisor (and the GB/s that comes
+    // out of it is not a bandwidth - it is the divisor)
+    for (auto& kv : t_tok) kv.second.clear();
+    t_tok.clear();
+    for (auto& kv : t_ev) kv.second.n = 0;   // no interval is attributed across a skipped token
+    for (auto& kv : t_time) kv.second.clear();
+}
+
+void stage_ledger_commit(int device, cudaStream_t s, bool keep) {
+    if (!stage_ledger_on()) return;
+    // the last stage's mark() has already flushed (t_cur is empty here): only launches after it would be left, and
+    // those are given their own interval so nothing is silently dropped from either the bytes or the time
+    if (t_cur.count(device) && !t_cur[device].empty()) stage_ledger_flush(device, s, "unattributed");
+    auto it = t_tok.find(device);
+    std::lock_guard<std::mutex> lk(g_led_mu);
+    LedgerTotal& T = g_led[device];
+    if (keep && it != t_tok.end()) {
+        for (const auto& kv : it->second) {
+            LedgerMap& d = T.stage[kv.first];
+            for (const auto& e : kv.second) {
+                LedgerVal& v = d[e.first];
+                v.jobs += e.second.jobs;
+                v.bytes += e.second.bytes;
+                v.passes += e.second.passes;
+                v.n_in = e.second.n_in;
+                v.n_out = e.second.n_out;
+            }
+        }
+        ++T.tokens;
+    }
+    // the same arithmetic the prof table does: interval i-1 -> i belongs to the stage event i closes.  Read HERE,
+    // after collect()'s stream sync, so the events have completed and the times are real.
+    auto& ev = t_ev[device];
+    auto& tms = t_time[device];
+    if (keep) {
+        for (size_t i = 1; i < ev.n; ++i) {
+            float ms = 0.0f;
+            if (cudaEventElapsedTime(&ms, ev.ev[i - 1], ev.ev[i]) == cudaSuccess)
+                tms[ev.ev_name[i] != nullptr ? ev.ev_name[i] : "unattributed"] += (double) ms;
+        }
+        for (const auto& kv : tms) T.ms[kv.first] += kv.second;
+    }
+    tms.clear();
+    // the next token starts a fresh chain: its first stage has no previous event to measure from (the interval that
+    // would span the token boundary carries the boundary's own work - the hop copies, the sampler - not a GEMV stage)
+    ev.n = 0;
+    if (it != t_tok.end()) t_tok.erase(it);
+}
+
+void stage_ledger_get(int device,
+                      void (*cb)(void* ctx, const char* stage, int type, int ncol, uint64_t jobs, double bytes,
+                                 uint64_t passes, int64_t n_in, int64_t n_out, double ms),
+                      void* ctx, uint64_t* tokens) {
+    if (!stage_ledger_on()) return;
+    std::lock_guard<std::mutex> lk(g_led_mu);
+    auto it = g_led.find(device);
+    if (it == g_led.end()) {
+        if (tokens != nullptr) *tokens = 0;
+        return;
+    }
+    if (tokens != nullptr) *tokens = it->second.tokens;
+    for (const auto& st : it->second.stage)
+        for (const auto& e : st.second)
+            cb(ctx, st.first.c_str(), e.first.type, e.first.ncol, e.second.jobs, e.second.bytes, e.second.passes,
+               e.second.n_in, e.second.n_out, it->second.ms.count(st.first) ? it->second.ms.at(st.first) : 0.0);
+}
+
+namespace {
+// the ledger's note for one mv()'s jobs (each reads its weight rows once, whatever its column count)
+inline void note_jobs(const MvJob* jobs, int n) {
+    if (!stage_ledger_on()) return;
+    for (int i = 0; i < n; ++i) stage_ledger_note(jobs[i].type, jobs[i].ncol, jobs[i].n_in, jobs[i].n_out, 1);
+}
+}  // namespace
+
 #if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 namespace {
 // The RDNA3 GEMV's shape: R rows per wave, U super-blocks in flight, WPB waves per block, the Q6_K activations in LDS
@@ -5589,9 +5824,28 @@ void mv_rdna_launch(const MvBatch& b, int blocks, int r, int u, int wpb, int lds
 // kMaxRdnaNt activations (its kernels take 8 at most - the rest go to the other kernels).
 bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
     if (nt > kMaxRdnaNt || !mv_rdna_device()) return false;
+    // MAYA_GLM_MV_SHAPE=r,u,wpb,lds: this device's dense-GEMV shape, mv_config by environment (the default shape was
+    // measured on a Radeon 8065S APU - LPDDR5X, where in-flight loads hide the latency; on this part the same
+    // in-flight depth measured monotonically worse for the expert kernels, research/r18/u19)
+    static const int env_shape = [] {
+        const char* v = std::getenv("MAYA_GLM_MV_SHAPE");
+        if (v == nullptr) return 0;
+        int a[4] = {0, 0, 0, 0};
+        const int got = std::sscanf(v, "%d,%d,%d,%d", &a[0], &a[1], &a[2], &a[3]);
+        if (got >= 1) g_mv_r.store(a[0]);
+        if (got >= 2) g_mv_u.store(a[1]);
+        if (got >= 3) g_mv_wpb.store(a[2]);
+        if (got >= 4) g_mv_lds.store(a[3]);
+        return got;
+    }();
+    (void) env_shape;
     int r = g_mv_r.load(std::memory_order_relaxed), u = g_mv_u.load(std::memory_order_relaxed);
     const int wpb = g_mv_wpb.load(std::memory_order_relaxed) == 4 ? 4 : 8;
-    if (r < 0) { r = 1; u = 2; }
+    // (r < 0: the measured shape below.  The APU's was R=1 row a wave with U=2 super-blocks in flight; on this part
+    // U=1 with R=2 measured 1.053x end to end - decode 18.38 -> 19.35 tok/s, three paired runs, and it is the
+    // direction research/r18/u19 found for the expert kernels (in-flight depth monotonically worse).  The family it
+    // moves: kda_proj_mv 1.147x, kda_out_mv 1.179x, dsa_out_mv 1.154x, router_shexp_mv 1.062x.)
+    if (r < 0) { r = 2; u = 1; }
     if (nt > 1 && r > 2) r = 2;
     MvBatch b{};
     int acc = 0, m = 0, max_in = 0;
@@ -5607,7 +5861,10 @@ bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
     if (m == 0) return true;
     b.n = m;
     const int lds_mode = g_mv_lds.load(std::memory_order_relaxed);
-    const bool use_lds = lds_mode > 0 || (lds_mode < 0 && nt == 1 && max_in <= 4096);
+    // (R61) nt > 1 included: the verify window's Q6_K jobs stage their activations too.  S6 of R61's shape
+    // sweep measured the staging worth 3.5% at nt = 1 (LDS off: 45.80 ms/21.83 against 44.22/22.61), and the
+    // window is the serial chain (R56), yet it was the one path still served from global memory.
+    const bool use_lds = lds_mode > 0 || (lds_mode < 0 && max_in <= 4096);
     int lds = use_lds ? nt * (max_in / 32) * (int) sizeof(block_q8_1) : 0;
     if (lds > 48 * 1024) lds = 0;
     switch (nt) {
@@ -5686,6 +5943,7 @@ static bool mv_inputs_ok(const MvJob* jobs, int n, const char* who) {
 
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     if (n <= 0 || n > kMaxMvJobs) return false;
+    note_jobs(jobs, n);
     for (int i = 0; i < n; ++i)
         if (jobs[i].ncol < 1 || jobs[i].ncol > kMaxMvCols) {
             std::fprintf(stderr, "glm_fast mv: %d columns (1..%d)\n", jobs[i].ncol, kMaxMvCols);
@@ -5958,6 +6216,7 @@ void mv_nt_launch(const MvJob* jobs, int n, bool typed, bool* done, cudaStream_t
 
 bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
     if (nt <= 1) return mv(jobs, n, s);
+    note_jobs(jobs, n);
     if (n <= 0 || n > kMaxMvJobs || nt > kMaxMvNt) return false;
     for (int i = 0; i < n; ++i)
         if (!mv_type_ok(jobs[i].type) || jobs[i].ncol != 1) {
@@ -6279,6 +6538,23 @@ MlaAttn2 mla2_shape() {
     static const MlaAttn2 env = env_shape<MlaAttn2, parse_mla2>("MAYA_GLM_MLA_ATTN2");
     return g_mla2_set.load(std::memory_order_acquire) ? g_mla2_bench : env;
 }
+
+// The decode token path's defaults (R51): the take-two shapes measured bit-exact against the originals at the engine's
+// own geometry (glm_attn_bench --sweep, n_sel 2051): dsa_score sx1b2 2.33x at 128K, mla_split h16xvc 1.40x.  An explicit
+// MAYA_GLM_DSA_SCORE2 / MAYA_GLM_MLA_ATTN2 (or the bench's override) still wins, so "0"/"original" restores the
+// originals and a sweep can still pick any shape.  The prompt path never reaches these (its callers pass token=false).
+DsaScore2 dsa2_env_default(const DsaScore2& t) {
+    if (t.on || getenv("MAYA_GLM_DSA_SCORE2") != nullptr || g_dsa2_set.load(std::memory_order_acquire)) return t;
+    DsaScore2 d;
+    if (parse_dsa2("sx1b2", d)) return d;
+    return t;
+}
+MlaAttn2 mla2_env_default(const MlaAttn2& t) {
+    if (t.on || getenv("MAYA_GLM_MLA_ATTN2") != nullptr || g_mla2_set.load(std::memory_order_acquire)) return t;
+    MlaAttn2 d;
+    if (parse_mla2("h16xvc", d)) return d;
+    return t;
+}
 // the engine's own record of the kernels each device's attention runs, once per device (the dispatch proof)
 void note_kernel(std::atomic<unsigned>& seen, int device, const char* what, const std::string& label) {
     if (device < 0 || device >= 32) return;
@@ -6315,7 +6591,7 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
     // the take-two kernel on the decode's token path only (and under the bench's override); the record is the token
     // path's - a prompt's windows, which keep the original, never write it
     const bool path = token || g_dsa2_set.load(std::memory_order_acquire);
-    const DsaScore2 t = path ? dsa2_shape() : DsaScore2{};
+    const DsaScore2 t = path ? dsa2_env_default(dsa2_shape()) : DsaScore2{};
     const bool two = t.on && idx_heads == kDsaH && key_dim == kDsaK;
     int dev = 0;
     cudaGetDevice(&dev);
@@ -6593,7 +6869,7 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
                       : nullptr;
     // the take-two kernels on the decode's token path only (and under the bench's override), as dsa_score
     const bool path = token || g_mla2_set.load(std::memory_order_acquire);
-    const MlaAttn2 t2 = path ? mla2_shape() : MlaAttn2{};
+    const MlaAttn2 t2 = path ? mla2_env_default(mla2_shape()) : MlaAttn2{};
     if (path && part != nullptr && cap >= n_chunks) note_kernel(g_mla2_seen, dev, "mla split attention", mla2_label(t2));
     if (part != nullptr && cap >= n_chunks && t2.on) {
         const size_t smem2 = (size_t) MLA_CHUNK * kv_lora * sizeof(uint16_t) + (size_t) t2.hpb * MLA_CHUNK * sizeof(float);
@@ -6962,16 +7238,31 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
                  const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s) {
     MoeDev d = d_in;
     d.skip = g_skip;
+    // the ledger: the routed experts' gate and up rows (the shared down, when fused here, its own)
+    stage_ledger_note(gu_type, 1, n_embd, 2 * n_ff, (uint64_t) std::max(0, k));
+    if (sh_down != nullptr && sh_out != nullptr) stage_ledger_note(sh_type, 1, n_ff_sh, n_embd, 1);
 #if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true, gu_type == 22 && gu22_tuned());
     if (gu_type == 22) note_gu22(tuned, 0);
     if (tuned) {
-        // Packed sign expansion, original 16-wave/four-row geometry, grid in LDS.
+        // Packed sign expansion, original 16-wave/four-row geometry, grid in LDS; WIDE reads a super-block's
+        // qs as one 8-byte word instead of two 16-bit halves, and SPLIT compiles the shared-expert-down branch
+        // out of this kernel (it runs as its own launch below, which costs a serial tail of about 1.0 ms a token
+        // on this part - see the SPLIT note in RALPH_STATE.md, Round 15).  Together they take the hot kernel from
+        // 255 VGPRs to 51: measured 10.275 -> 7.295 ms/token on the decode shape over the 288-expert pool,
+        // decode 15.98 -> 17.15 tok/s (research/r17/gap18.mu).  Numerics unchanged: same bytes, same dot order.
+        // NW=32 (1024 threads) instead of 16 (512): measured on the real gf:: kernel, 12 layers x 8 experts over
+        // the 288-expert pool, 6.842 -> 6.455 ms = 1.06x (research/r18, /tmp/rb_r15).  Rows per warp
+        // RPW = GU_ROWS / NW = 1, so each warp still owns one gate and one up row: same bytes, same dot order.
+        // (R13/R14 explained this as an occupancy climb out of 25%; that arithmetic used regsPerMultiprocessor
+        // 65536 and warpSize 32, but this part reports 131072 and 128 (research/r18/occ.mu), and the production
+        // instance is Temp=51, so two 1024-thread blocks already fit a CU.  The 1.06x is real; the occupancy
+        // story behind it is not.)
         if (gu_type == 16)
-            launch_expert_gu<16, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
+            launch_expert_gu<16, 32, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
                 xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
         else
-            launch_expert_gu<22, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
+            launch_expert_gu<22, 32, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
                 xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
         launch_check("moe_gate_up RDNA3");
         return;
@@ -7016,6 +7307,11 @@ void gate_up(Variant v, int type, const MoeDev& d, int k, int n_embd, int n_ff, 
     else if (v == Variant::direct_signs) launch_expert_gu<T,16,true,true,false,true>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
     else if (v == Variant::vector_load) launch_expert_gu<T,16,true,true,false,false,true>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
     else if (v == Variant::occupancy8) launch_expert_gu<T,16,true,true,true,false,false,8>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
+    else if (v == Variant::signs) launch_expert_gu<T,16,false,true,true,false,true>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
+    else if (v == Variant::rows8) launch_expert_gu<T,8,false,true,true,true,true>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
+    else if (v == Variant::global_rows8) launch_expert_gu<T,32,false,true,true,true,true>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
+    else if (v == Variant::rows2) launch_expert_gu<T,2,false,true,true,true,true>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
+    else if (v == Variant::fused_shared32) launch_expert_gu<T,32,false,true,false,true,true>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
     else if (v == Variant::split_shared) launch_expert_gu<T, 16, true, true, true>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
     else if (v == Variant::global_plain) launch_expert_gu<T, 16, true, false>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
     else if (v == Variant::global_waves8) launch_expert_gu<T, 8, true>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
@@ -7084,6 +7380,7 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
               const float* sh_out, float* out, cudaStream_t s) {
     MoeDev d = d_in;
     d.skip = g_skip;
+    stage_ledger_note(d_type, 1, n_ff, n_embd, (uint64_t) std::max(0, k));   // the routed experts' down rows
 #if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     // IQ3_XXS down regresses on gfx1151; let it use the original dispatch below.
     if ((d_type == 22 || d_type == 18) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {

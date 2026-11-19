@@ -892,6 +892,14 @@ struct Glm5Model::FastState {
             cudaEventRecord(ev[ev_n], st);
             ev_name[ev_n] = nm;
             ++ev_n;
+            // MAYA_GLM_R63_STAGE: close the window stage in the ledger too.  The prefix matters: the window path runs
+            // the same gf::mv() with the same types under its own names, and without it those bytes landed on
+            // whatever TOKEN-path stage was marked next - the R50 mistake again (a row reading faster than the card's
+            // peak, because its bytes and its ms came from different launches).
+            if (gf::stage_ledger_on()) {
+                int d = 0;
+                if (cudaGetDevice(&d) == cudaSuccess) gf::stage_ledger_flush(d, st, (std::string("win:") + nm).c_str());
+            }
         }
     } win;
     // ---- the DFlash drafter's target features (src/core/glm_dflash.cu): at each captured layer here, the input's
@@ -967,6 +975,7 @@ struct Glm5Model::FastState {
     int read_chunks = 0;         // set_read_chunks: a disk read's pieces (0: MAYA_GLM_READ_CHUNKS, else 8)
     // ---- MAYA_GLM_PROF=1: a cudaEvent after every launch, the gaps summed per kernel name (debug only)
     bool prof_on = false;
+    int prof_dev = -1;   // the device the profiler's ledger counts under (set with prof_on)
     bool kda_graph_on = false;   // experimental, single-device ordinary decode only
     glmfast::LayerGraphs kda_graphs;
     std::vector<cudaEvent_t> pev;
@@ -983,11 +992,15 @@ struct Glm5Model::FastState {
         }
         cudaEventRecord(pev[pn], cs);
         pname[pn] = nm;
+        // MAYA_GLM_R63_STAGE: the GEMV calls launched since the last mark are this stage's - the ledger takes them
+        // under the same name the prof table gives the interval that ends here
+        if (gf::stage_ledger_on()) gf::stage_ledger_flush(prof_dev, cs, nm);
         ++pn;
     }
     uint64_t pseen = 0, pskip = 0;   // MAYA_GLM_PROF=<n>: the first n tokens (the cold tiers) are not counted
     void collect() {
         if (pseen++ < pskip) {
+            gf::stage_ledger_discard();
             pn = 0;
             return;
         }
@@ -996,6 +1009,7 @@ struct Glm5Model::FastState {
             if (cudaEventElapsedTime(&ms, pev[i - 1], pev[i]) == cudaSuccess) pacc[pname[i]] += ms;
         }
         if (pn > 0) ++ptokens;
+        if (gf::stage_ledger_on()) gf::stage_ledger_commit(prof_dev, cs, pn > 0);
         pn = 0;
     }
     size_t tab_key(int key) const { return (size_t) key; }

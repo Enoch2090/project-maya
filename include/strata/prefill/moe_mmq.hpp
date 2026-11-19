@@ -114,5 +114,13 @@ bool to_f16_supported(int ggml_type);
 /// The `n` weights at `w` (whole blocks of `ggml_type`, row-major) as FP16 at `dst` (IEEE half bits); false when the
 /// type is not covered.
 bool to_f16(int ggml_type, const void* w, uint16_t* dst, int64_t n, void* stream);
+/// `count` experts' weights, each `n` values of `ggml_type`, dequantized by ONE launch into `dst` at
+/// `k * n`; `w[k]` are their own sources (the batch's experts are not contiguous in the pool, its
+/// destinations are).  False when the type/size is not covered, in which case the caller keeps its
+/// per-expert to_f16 loop.  MUSA only: needs the shared-table body (MAYA_GLM_DEQ_SMEM=1, the default).
+bool to_f16_multi_ok(int ggml_type, int64_t n, int count);
+/// The launch.  Call to_f16_multi_ok for EVERY matrix the caller means to batch before calling this on any of
+/// them - a false here is meant to be answered by the caller's per-expert loop, which would otherwise redo work.
+bool to_f16_multi(int ggml_type, const void* const* w, uint16_t* dst, int64_t n, int count, void* stream);
 
 }  // namespace strata::prefill::mmq

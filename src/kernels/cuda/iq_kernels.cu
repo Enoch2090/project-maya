@@ -795,6 +795,38 @@ __device__ void dq_iq3_xxs_half(const void* vx, int64_t ibs, int h, int sub, dst
         }
     }
 }
+// And the same 128-value half for IQ2_XXS (Maya-S's gate/up matrices, the larger half of the expert weight): `h`,
+// `sub`, `il`, `ib4` and the output mapping are dq_iq3_xxs_half's, while IQ2_XXS keeps TWO 8-value groups per
+// 16-value sub-block (its aux32 packs seven sign bits for each of four groups, not eight for two), at qs[4*ib + il]
+// and qs[4*ib + il + 2].  Its eight values per group are contiguous and eight-aligned: four half2 stores.
+template<typename dst_t>
+__device__ void dq_iq2_xxs_half(const void* vx, int64_t ibs, int h, int sub, dst_t* yy,
+                                const uint64_t* codebook = iq2xxs_grid) {
+    const block_iq2_xxs* x = (const block_iq2_xxs*) vx;
+    const int il = sub >> 2, ib4 = sub & 3, ib = 4 * h + ib4;
+    dst_t* y = yy + 32 * ib4 + 8 * il;
+    // ggml's sub-block walk is x.qs + 4*ib32 on a uint16_t* qs (8 bytes a step, 8 steps over the 64-byte qs):
+    // q2[0..1] are aux32[0] (the four grid indices, as bytes) and q2[2..3] are aux32[1] (the 4-bit scale and the
+    // seven sign bits per group) - the same expressions as ggml's dequantize_row_iq2_xxs.
+    const uint16_t* q2 = x[ibs].qs + 4 * ib;
+    const uint8_t* aux8 = (const uint8_t*) q2;
+    const uint8_t* grid = (const uint8_t*) (codebook + aux8[il]);
+    const uint32_t aux32 = q2[2] | (q2[3] << 16);
+    const float d = (float) x[ibs].d * (0.5f + (aux32 >> 28)) * 0.25f;
+    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+    if constexpr (std::is_same_v<dst_t, __half>) {
+#pragma unroll
+        for (int j = 0; j < 8; j += 2) {
+            const float l0 = d * (float) grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+            const float l1 = d * (float) grid[j + 1] * (signs & kmask_iq2xs[j + 1] ? -1.f : 1.f);
+            *reinterpret_cast<__half2*>(y + j) = __floats2half2_rn(l0, l1);
+        }
+    } else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            y[j] = cvt<dst_t>(d * (float) grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+    }
+}
 // And the same 128-value half for IQ2_S: `h`, `sub`, `il`, `ib4` and the output mapping are dq_iq3_s_half's, while
 // the 1024-entry 64-bit grid, the nibble scale (bits 0..3 for il 0/1, 4..7 for il 2/3) and the sign byte at
 // qs[QK_K/8 + 4*ib + il] are dq_iq2_s's own expressions.  Its eight values are one contiguous group, so the half
@@ -1197,14 +1229,59 @@ bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 // ---- Volta prompt experts (MAYA_PF_WMMA): a group's experts as one launch of FP16 tensor-core tiles, the weights
 // dequantized into shared memory by dq_dispatch (the FP16 path's own formulas), the activations FP16, FP32 sums.
 // Replaces MMQ's dp4a products on sm_70, and the FP16 path's dequantize-to-global + one cuBLAS call per expert.
-#if !defined(__HIPCC__)
+// The grouped FP16 tensor-core products.  Upstream guarded the kernel body on `__CUDA_ARCH__ >= 700`
+// (sm_70 = the first CUDA part with a usable m16n16k16 HMMA).  MUSA's mcc defines neither __CUDA_ARCH__ nor the
+// nvcuda namespace, so on the MTT S4000 that guard compiled every one of these kernels to an EMPTY BODY - a launch
+// that reports success and writes nothing (verified: research/r6/guard.mu).  mtmusa::wmma is a working
+// m16n16k16 HMMA (75 TFLOP/s against 8.5 on FFMA, and numerically exact: research/r6/wmma_num.mu test1 rel L2
+// 7.3e-08), so the backend takes the same bodies through its own namespace.  GLMF_WG_TC is the portable spelling of
+// the sm_70 test; it is also the only place the two namespaces are chosen between.
+#if defined(STRATA_USE_MUSA)
+#define GLMF_WG_WMMA mtmusa
+#define GLMF_WG_TC 1
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#define GLMF_WG_WMMA nvcuda
+#define GLMF_WG_TC 1
+#else
+#define GLMF_WG_TC 0
+#endif
+#if !defined(__HIPCC__) || defined(STRATA_USE_MUSA)
 #include <mma.h>
 namespace strata::kernels {
 namespace {
-constexpr int WG_BM = 64, WG_BN = 128, WG_THREADS = 256, WG_XK = 128, WG_MT = 4;
+constexpr int WG_BM = 64, WG_BN = 128, WG_XK = 128, WG_MT = 4;
+// Block width.  On MUSA wmma is a collective over the PHYSICAL 128-lane warp (see WG_PW below), so a 256-thread
+// block holds only two of them and each must carry four 32 x 32 sub-tiles: 32 accumulator fragments, i.e. 256
+// registers a thread, far past the 255 a thread has.  Measured at that shape the product spilled to 1.0 TFLOP/s and
+// 0.6 GB/s on the weights (research/r8/gemm_bench.mu) - slower than the FP16 path it was meant to replace, which is
+// why the first correct build of this branch ran a 32K prompt 10.8x slower.  A 512-thread block holds four physical
+// warps, so each carries two sub-tiles: 16 fragments, the same register bill the CUDA layout has always had.
+// 256 on both backends.  A wider MUSA block (512) halves each physical warp's sub-tile count and so the register
+// bill, and measured 1.6 TFLOP/s against 1.0 - but IQ2_S's small tile is XK 32, where a 512-thread block gives
+// XQ = 64*(32/8)/512 = 0, i.e. no activation tile loaded at all, and that instantiation came out WRONG
+// (research/r8/down_probe.mu: 493 unwritten rows).  That kernel is left out of MAYA_PF_WMMA instead of being
+// threaded differently, because the product is not on the default path at all (see moe_wmma_on).
+constexpr int WG_THREADS = 256;
+// The 64 x 128 output tile is cut into 32 x 32 sub-tiles, one per warp in CUDA's 32-lane spelling.  On MUSA the
+// wmma intrinsic is a collective over the PHYSICAL warp, which MTT S4000 reports as 128 lanes: a 256-thread block
+// is two physical warps, and a 32-lane sub-warp of one that calls load_matrix_sync/mma_sync gets nothing back
+// (research/r8/warp_scope.mu: of eight logical warps only 0 and 4 - the leaders of the two physical warps -
+// produced a result; the rest left the accumulator at its fill).  That is why this product wrote zeros past the
+// first 32 of every 128 output columns (research/r8/gemm_probe3.mu), which the router read as a non-finite score.
+// So the sub-tiles are dealt out to PHYSICAL warps and each carries its share in a loop.  On CUDA WG_PW is 32, so
+// every warp still carries exactly one sub-tile and the layout is unchanged there.
+#if defined(STRATA_USE_MUSA)
+constexpr int WG_PW = 128;
+#else
+constexpr int WG_PW = 32;
+#endif
+constexpr int WG_NPC = WG_THREADS / WG_PW;                              // physical warps in a block
+constexpr int WG_NS  = (WG_BM / 32) * (WG_BN / 32);                     // 32 x 32 sub-tiles the tile holds
+constexpr int WG_NSP = WG_NS / WG_NPC;                                  // sub-tiles each physical warp carries
 // The static codebook a TY carries (the kernel's `codebook`), which counts toward the block's shared memory.
 __host__ __device__ constexpr size_t wg_codebook_words(int ty) {
-    return (size_t) (ty == 22 ? 1024 : ty == 21 ? 256 : ty == 18 ? 128 : 2);
+    // ty 16 (IQ2_XXS): TABLE of 256 uint64 (iq2xxs_grid) - Maya-S's gate/up matrices
+    return (size_t) (ty == 22 ? 1024 : ty == 21 ? 256 : ty == 18 ? 128 : ty == 16 ? 256 : 2);
 }
 __host__ __device__ constexpr size_t gemm_iq_f16_grouped_smem(int wk, int xk = WG_XK) {
     return (size_t) WG_BN * (wk + 8) * 2 + (size_t) WG_BM * (xk + 8) * 2;
@@ -1230,8 +1307,8 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
                   "the two-m-tile tiles are the 128-value chunks; only IQ2_S's 8 KiB codebook needs XK 32");
     static_assert(MT != 2 || wg_codebook_words(TY) * sizeof(uint64_t) + gemm_iq_f16_grouped_smem(WK, XK) <= 48 * 1024,
                   "a small tile's static codebook and dynamic tiles must fit 48 KiB so two blocks fit one SM");
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-    using namespace nvcuda;
+#if GLMF_WG_TC
+    using namespace GLMF_WG_WMMA;
     constexpr int LDW = WK + 8, LDX = XK + 8;
     extern __shared__ __align__(16) unsigned char wg_smem[];
     __half* sw = reinterpret_cast<__half*>(wg_smem);            // [BN][LDW]
@@ -1244,8 +1321,13 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
     const int n0 = blockIdx.x * WG_BN;
     const uint8_t* we = wsrc == 0 ? W + (size_t) e * expert_bytes
                                   : (const uint8_t*) (wsrc == 1 ? tbl.gu[e] : tbl.dn[e]);
-    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int wm = warp >> 2, wn = warp & 3;                     // rows wm*32, cols wn*32 of an m-tile
+    const int tid = threadIdx.x, lane = tid & 31;                // (lane: the decoders' 32-lane walk)
+    const int warp = tid >> 5;
+    // the 32 x 32 sub-tiles this PHYSICAL warp carries: sub-tile `sub` is rows (sub >> 2)*32, cols (sub & 3)*32
+    const int pw = tid / WG_PW;
+    auto sub_of = [pw](int sp) { return pw + sp * WG_NPC; };
+    auto sub_wm = [](int sub) { return sub >> 2; };
+    auto sub_wn = [](int sub) { return sub & 3; };
     __shared__ uint64_t codebook[wg_codebook_words(TY)];
     auto* grid32 = reinterpret_cast<uint32_t*>(codebook);
     auto* grid8 = reinterpret_cast<int8_t*>(codebook);
@@ -1256,19 +1338,23 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
             for (int i = tid; i < 512; i += WG_THREADS) grid32[i] = iq3s_grid[i];
         } else if constexpr (TY == 18) {
             for (int i = tid; i < 256; i += WG_THREADS) grid32[i] = iq3xxs_grid[i];
+        } else if constexpr (TY == 16) {
+            for (int i = tid; i < 256; i += WG_THREADS) codebook[i] = iq2xxs_grid[i];
         } else if (tid < 16) grid8[tid] = kvalues_iq4nl[tid];
         __syncthreads();
     } else if constexpr (DEC == 2) {
         if (tid < 16) grid8[tid] = kvalues_iq4nl[tid];
         __syncthreads();
     }
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[MT][2][2];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[MT][WG_NSP][2][2];
 #pragma unroll
     for (int t = 0; t < MT; ++t)
 #pragma unroll
-        for (int a = 0; a < 2; ++a)
+        for (int s = 0; s < WG_NSP; ++s)
 #pragma unroll
-            for (int b = 0; b < 2; ++b) wmma::fill_fragment(acc[t][a][b], 0.0f);
+            for (int a = 0; a < 2; ++a)
+#pragma unroll
+                for (int b = 0; b < 2; ++b) wmma::fill_fragment(acc[t][s][a][b], 0.0f);
     // the activation tiles in order (k0, m-tile, half): the next one's XQ uint4 per thread are loaded into registers
     // while the current one is multiplied (the first before the weights' dequantization)
     constexpr int XQ = WG_BM * (XK / 8) / WG_THREADS;
@@ -1290,7 +1376,7 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
     int it = 0;
     for (int k0 = 0; k0 < K; k0 += WK) {
         if constexpr (DEC == 0) {
-            if constexpr (WK == 128 && (TY == 18 || TY == 21 || TY == 22)) {
+            if constexpr (WK == 128 && (TY == 16 || TY == 18 || TY == 21 || TY == 22)) {
                 // The small tile: a WK-128 chunk is one 128-value half of an IQ3_XXS / IQ3_S / IQ2_S superblock,
                 // its sub-blocks ib = 4*kh .. 4*kh + 3 landing at columns 0 .. 127, sixteen lanes to a row and two
                 // rows per warp, so a lane decodes the same eight values per half as the 256-value decoders below
@@ -1299,7 +1385,8 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
                 for (int r = 2 * warp + rr; r < WG_BN; r += 2 * (WG_THREADS / 32)) {
                     const uint8_t* wr = we + (size_t) (n0 + r) * row_bytes;
                     auto* out = sw + r * LDW;
-                    if constexpr (TY == 18) dq_iq3_xxs_half(wr, k0 / 256, kh, sub, out, grid32);
+                    if constexpr (TY == 16) dq_iq2_xxs_half(wr, k0 / 256, kh, sub, out, codebook);
+                    else if constexpr (TY == 18) dq_iq3_xxs_half(wr, k0 / 256, kh, sub, out, grid32);
                     else if constexpr (TY == 21) dq_iq3_s_half(wr, k0 / 256, kh, sub, out, grid32);
                     else dq_iq2_s_half(wr, k0 / 256, kh, sub, out, codebook);
                 }
@@ -1316,6 +1403,7 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
             }
         } else if constexpr (DEC == 1) {
             const int r = tid >> 1, blk = tid & 1;               // one thread per (row, 64-value block)
+            if (r < WG_BN) {
             const block_q2_0* b = reinterpret_cast<const block_q2_0*>(we + (size_t) (n0 + r) * row_bytes) + k0 / 64 + blk;
             // Codes select {-d, signed zero, d, 2*d}. Pack two exact FP16 weights with
             // a byte permutation instead of repeated integer-to-float conversions.
@@ -1338,8 +1426,10 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
                     *reinterpret_cast<uint32_t*>(o + 4 * c + 2 * pair) = __byte_perm(table01, table23, selector);
                 }
             }
+            }
         } else {
             const int r = tid >> 1, h = tid & 1;                 // one thread per (row, 64-value half of the chunk)
+            if (r < WG_BN) {
             const block_iq4_nl* b = reinterpret_cast<const block_iq4_nl*>(we + (size_t) (n0 + r) * row_bytes) + k0 / 32 + 2 * h;
             __half* o = sw + r * LDW + h * 64;
 #pragma unroll
@@ -1356,6 +1446,7 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
                     *reinterpret_cast<__half2*>(o + 32 * blk + 16 + j) = __hmul2(d, hi);
                 }
             }
+            }
         }
 #pragma unroll
         for (int t = 0; t < MT; ++t) {
@@ -1366,23 +1457,30 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
 #pragma unroll
                 for (int q = 0; q < XQ; ++q) {
                     const int i = tid + q * WG_THREADS, r = i / (XK / 8), c = (i % (XK / 8)) * 8;
-                    *reinterpret_cast<uint4*>(sx + r * LDX + c) = xr[q];
+                    if (r < WG_BM) *reinterpret_cast<uint4*>(sx + r * LDX + c) = xr[q];
                 }
                 __syncthreads();
                 if (it + 1 < total) load_x(it + 1);
 #pragma unroll
                 for (int kk = 0; kk < XK; kk += 16) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a[2];
-                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b[2];
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a[WG_NSP][2];
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b[WG_NSP][2];
 #pragma unroll
-                    for (int f = 0; f < 2; ++f) {
-                        wmma::load_matrix_sync(a[f], sx + (wm * 32 + f * 16) * LDX + kk, LDX);
-                        wmma::load_matrix_sync(b[f], sw + (wn * 32 + f * 16) * LDW + xh * XK + kk, LDW);
+                    for (int s = 0; s < WG_NSP; ++s) {
+                        const int wms = sub_wm(sub_of(s)), wns = sub_wn(sub_of(s));
+#pragma unroll
+                        for (int f = 0; f < 2; ++f) {
+                            wmma::load_matrix_sync(a[s][f], sx + (wms * 32 + f * 16) * LDX + kk, LDX);
+                            wmma::load_matrix_sync(b[s][f], sw + (wns * 32 + f * 16) * LDW + xh * XK + kk, LDW);
+                        }
                     }
 #pragma unroll
-                    for (int fa = 0; fa < 2; ++fa)
+                    for (int s = 0; s < WG_NSP; ++s)
 #pragma unroll
-                        for (int fb = 0; fb < 2; ++fb) wmma::mma_sync(acc[t][fa][fb], a[fa], b[fb], acc[t][fa][fb]);
+                        for (int fa = 0; fa < 2; ++fa)
+#pragma unroll
+                            for (int fb = 0; fb < 2; ++fb)
+                                wmma::mma_sync(acc[t][s][fa][fb], a[s][fa], b[s][fb], acc[t][s][fa][fb]);
                 }
             }
         }
@@ -1395,10 +1493,15 @@ __global__ void __launch_bounds__(WG_THREADS, MT == 2 ? 2 : 1) gemm_iq_f16_group
         if (t >= nmt) break;
         const int rows = min(WG_BM, crow - t * WG_BM);
 #pragma unroll
-        for (int fa = 0; fa < 2; ++fa)
+        for (int s = 0; s < WG_NSP; ++s) {
+            const int wms = sub_wm(sub_of(s)), wns = sub_wn(sub_of(s));
 #pragma unroll
-            for (int fb = 0; fb < 2; ++fb)
-                wmma::store_matrix_sync(so + (wm * 32 + fa * 16) * LDO + wn * 32 + fb * 16, acc[t][fa][fb], LDO, wmma::mem_row_major);
+            for (int fa = 0; fa < 2; ++fa)
+#pragma unroll
+                for (int fb = 0; fb < 2; ++fb)
+                    wmma::store_matrix_sync(so + (wms * 32 + fa * 16) * LDO + wns * 32 + fb * 16, acc[t][s][fa][fb], LDO,
+                                            wmma::mem_row_major);
+        }
         __syncthreads();
         for (int i = tid; i < rows * (WG_BN / 4); i += WG_THREADS) {
             const int r = i / (WG_BN / 4), c = (i % (WG_BN / 4)) * 4;
@@ -1422,7 +1525,16 @@ unsigned gemm_iq_f16_grouped_caps(int dev) {
     if (!(per_dev[dev] & 1u)) {
         unsigned caps = 1u;                      // queried
         int major = 0;
-        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major >= 7) {
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) major = 0;
+#if defined(STRATA_USE_MUSA)
+        // The MUSA compat layer reports compute capability 2.2 (musaDevAttrComputeCapability*), which fails the
+        // sm_70 test the caps probe below asks for even though mtmusa::wmma is a working m16n16k16 HMMA.  Gate on
+        // the backend instead, and let the cudaFuncSetAttribute calls below still decide what each tile may take.
+        const bool has_tc = true;
+#else
+        const bool has_tc = major >= 7;
+#endif
+        if (has_tc) {
             const bool gu = cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<256, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gemm_iq_f16_grouped_smem(256)) == cudaSuccess;
             const bool g18 = cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<256, 0, 18>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gemm_iq_f16_grouped_smem(256)) == cudaSuccess;
             const bool g21 = cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<256, 0, 21>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gemm_iq_f16_grouped_smem(256)) == cudaSuccess;
@@ -1434,9 +1546,16 @@ unsigned gemm_iq_f16_grouped_caps(int dev) {
             const bool d2s = cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<128, 2, 0, 64, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gemm_iq_f16_grouped_smem(128, 64)) == cudaSuccess;
             const bool d18 = cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<128, 0, 18, 64, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gemm_iq_f16_grouped_smem(128, 64)) == cudaSuccess;
             const bool d22 = cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<128, 0, 22, 32, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gemm_iq_f16_grouped_smem(128, 32)) == cudaSuccess;
-            if (!gu || !g18 || !g21 || !g22 || !g23 || !d1 || !d2 || !d21 || !d2s || !d18 || !d22) (void) cudaGetLastError();
-            caps |= ((gu && g18 && g21 && g22 && g23) ? 2u : 0u) | (d1 ? 4u : 0u) | (d2 ? 8u : 0u) |
-                    (d21 ? 16u : 0u) | (d2s ? 32u : 0u) | (d18 ? 64u : 0u) | (d22 ? 128u : 0u);
+            const bool d16 = cudaFuncSetAttribute(gemm_iq_f16_grouped_kernel<128, 0, 16, 64, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gemm_iq_f16_grouped_smem(128, 64)) == cudaSuccess;
+            if (!gu || !g18 || !g21 || !g22 || !g23 || !d1 || !d2 || !d21 || !d2s || !d18 || !d22 || !d16) (void) cudaGetLastError();
+            // 2 = "this device can run a gate/up product at all", which now means EITHER tile: the wide one when the
+            // 83 KiB attribute is accepted, else the small one (43 KiB), which every backend takes.  The per-shape
+            // bits below say exactly which tiles are usable, and the launcher picks from them.
+            const bool wide_gu = gu && g18 && g21 && g22 && g23;
+            const bool small_gu = d16 && d18 && d21 && d22;
+            caps |= ((wide_gu || small_gu) ? 2u : 0u) | (d1 ? 4u : 0u) | (d2 ? 8u : 0u) |
+                    (d21 ? 16u : 0u) | (d2s ? 32u : 0u) | (d18 ? 64u : 0u) | (d22 ? 128u : 0u) |
+                    (d16 ? 256u : 0u) | (wide_gu ? 512u : 0u);
         }
         per_dev[dev] = caps;
     }
@@ -1464,9 +1583,15 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
     // The small tile decodes a weight chunk once per 128 token rows but hides the decode behind two blocks per
     // SM, which wins while the group's largest expert holds at most one chunk; past that the wide tile's half as
     // frequent weight decode pays for its single block.  Both tiles are exact: only the chunking differs.
-    const bool small = max_rows <= 2 * WG_BM && (dec == 2 || (dec == 0 && (ty == 18 || ty == 21 || ty == 22)));
-    const unsigned need = small ? (dec == 2 ? 32u : ty == 22 ? 128u : ty == 18 ? 64u : 16u)
-                                : dec == 0 ? 2u : dec == 1 ? 4u : 8u;
+    const bool small_ok = dec == 2 || (dec == 0 && (ty == 16 || ty == 18 || ty == 21 || ty == 22));
+    const unsigned small_bit = dec == 2 ? 32u : ty == 22 ? 128u : ty == 18 ? 64u : ty == 16 ? 256u : 16u;
+    // The wide tile's 128 x 256 half weight tile is 83 KiB, which needs the sm_70+ 96 KiB opt-in.  A device that
+    // refuses that attribute (MUSA's 72 KiB is one) still runs the SAMLL tile on the same fused body: 43 KiB of
+    // weight tile at XK 64, which every one of these backends accepts.  The difference is only granularity - the
+    // small tile re-decodes a weight chunk once per 128 token rows instead of once per 256 - so it is preferred
+    // even for groups wider than two chunks rather than falling back to dequantizing 50 MB an expert to global.
+    const bool small = small_ok && (max_rows <= 2 * WG_BM || !(caps & 512u));
+    const unsigned need = small ? small_bit : dec == 0 ? 2u : dec == 1 ? 4u : 8u;
     if (!(caps & need)) return false;
     const size_t row_bytes = iq_row_bytes(ty, K);
     const int mt = small || dec == 1 ? 2 : WG_MT;
@@ -1477,7 +1602,10 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
     const __half* x = (const __half*) X;
     const int wsrc = indirect == nullptr ? 0 : (down ? 2 : 1);
     const GroupedWeightTable tbl = indirect != nullptr ? *indirect : GroupedWeightTable{};
-    if (dec == 0 && small && ty == 18)
+    if (dec == 0 && small && ty == 16)
+        gemm_iq_f16_grouped_kernel<128, 0, 16, 64, 2><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(128, 64), s>>>(
+            ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
+    else if (dec == 0 && small && ty == 18)
         gemm_iq_f16_grouped_kernel<128, 0, 18, 64, 2><<<grid, WG_THREADS, gemm_iq_f16_grouped_smem(128, 64), s>>>(
             ty, w, expert_bytes, row_bytes, K, x, ldx, bounds, ids, chunks, Y, ldy, wsrc, tbl);
     else if (dec == 0 && small && ty == 21)

@@ -438,7 +438,9 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
                  g.idx_heads}, 0, E, g.idx_heads);
     static const bool prof = getenv("MAYA_GLM_WIN_PROF") != nullptr;
     const auto mark = [&](const char* nm) {
-        if (prof) W.mark(nm, s);
+        // (the ledger needs these boundaries as well: without them a window stage's GEMVs are attributed to the next
+        // token stage, and that row then reads faster than the card's memory can deliver)
+        if (prof || gf::stage_ledger_on()) W.mark(nm, s);
     };
     if (!gf::mv(j, 5, s)) { err = "glm window: dsa projections"; return false; }
     mark("dsa_proj_mv");
@@ -932,7 +934,9 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
     };
     static const bool prof = getenv("MAYA_GLM_WIN_PROF") != nullptr;
     const auto mark = [&](const char* nm) {
-        if (prof) W.mark(nm, s);
+        // (the ledger needs these boundaries as well: without them a window stage's GEMVs are attributed to the next
+        // token stage, and that row then reads faster than the card's memory can deliver)
+        if (prof || gf::stage_ledger_on()) W.mark(nm, s);
     };
     // a layer's first half for tokens t0 .. t0 + n - 1: the attention side, the FFN-side read, and the FFN up to its
     // routes (moe part 1) - or all of it (moe part 0 / a dense FFN).  The second half (moe part 2): the experts and the

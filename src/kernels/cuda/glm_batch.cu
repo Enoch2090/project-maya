@@ -703,7 +703,20 @@ __global__ void __launch_bounds__(1024) dsa_select_kernel(const float* __restric
 // same values): 34 KB, under the 48 KB every card gives without an opt-in - F32 rows (66 KB) were over Turing's
 // 64 KB, and every launch failed there (issue #8).
 constexpr int MB_HG = 16, MB_CH = 32;
-constexpr size_t kF32Smem = (size_t) MB_CH * 512 * sizeof(uint16_t) + (size_t) MB_HG * MB_CH * sizeof(float);
+// MB_CH_USE: how many of the token's cells are staged in shared memory at a time (sL is MB_CH_USE x 512 FP16).
+// It sets this kernel's OCCUPANCY, and on this backend that was the whole cost of the prompt attention.
+// The block is 256 threads, but this card's physical warp is 128 lanes (research/r18/occ.mu), so a block is
+// only TWO wave slots and the card has 48 of them; shared memory here is 73728 B a CU.  At MB_CH_USE = 32 the
+// request is 34816 B, i.e. TWO blocks a CU = 4 of 48 waves = 8% occupancy - and the kernel measured 0.95
+// TFLOP/s against this card's 9.20 TFLOP/s F32 FMA peak.  Halving the staged rows to 16 asks 17408 B, four
+// blocks fit, 17% occupancy, and the same kernel runs 1.55x faster (0.1377 -> 0.0869 ms a token-layer, 0.95 ->
+// 1.50 TFLOP/s) with the same output to 8.8e-08 relative L2 (research/r22/mbch.mu, T=2048, the engine's own
+// ascending-prefix cell pattern).  8 is slower again (1.35x): past 17% it is the __syncthreads() once every
+// MB_CH_USE cells, not occupancy, that binds.  Must stay 1..32: the softmax walks a 32-lane warp over the
+// MB_CH scores of a head, so the lanes past MB_CH_USE are masked (-INFINITY in, nothing written back).
+constexpr int MB_CH_USE = 16;
+static_assert(MB_CH_USE >= 1 && MB_CH_USE <= MB_CH, "the softmax walk is a 32-lane warp over MB_CH_USE scores");
+constexpr size_t kF32Smem = (size_t) MB_CH_USE * 512 * sizeof(uint16_t) + (size_t) MB_HG * MB_CH_USE * sizeof(float);
 static_assert(kF32Smem <= 48 * 1024, "the F32 prompt attention must fit the default 48 KB of shared memory");
 __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
                                                        const int* __restrict__ cells_all, const int* __restrict__ n_sel_arr,
@@ -711,9 +724,9 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
     constexpr int KV = 512;
     extern __shared__ float sm[];
     uint16_t* sL = (uint16_t*) sm;   // MB_CH x KV, FP16
-    float* sP = sm + MB_CH * KV / 2; // MB_HG x MB_CH
+    float* sP = sm + MB_CH_USE * KV / 2; // MB_HG x MB_CH
     __shared__ float s_m[MB_HG], s_l[MB_HG], s_scale[MB_HG];
-    __shared__ int s_cell[MB_CH];
+    __shared__ int s_cell[MB_CH_USE];
     const int t = blockIdx.x, h0 = blockIdx.y * MB_HG, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int ns = n_sel_arr[t];
     const int* cl = cells_all + (size_t) t * n_sel_max;
@@ -733,11 +746,11 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
         s_m[tid] = -INFINITY;
         s_l[tid] = 0.0f;
     }
-    for (int s0 = 0; s0 < ns; s0 += MB_CH) {
+    for (int s0 = 0; s0 < ns; s0 += MB_CH_USE) {
         __syncthreads();
-        if (tid < MB_CH) s_cell[tid] = s0 + tid < ns ? cl[s0 + tid] : -1;
+        if (tid < MB_CH_USE) s_cell[tid] = s0 + tid < ns ? cl[s0 + tid] : -1;
         __syncthreads();
-        for (int i = tid; i < MB_CH * KV / 4; i += blockDim.x) {
+        for (int i = tid; i < MB_CH_USE * KV / 4; i += blockDim.x) {
             const int s = i / (KV / 4), c4 = i - s * (KV / 4);
             const int cell = s_cell[s];
             ((uint2*) sL)[i] = cell < 0 ? make_uint2(0u, 0u)
@@ -745,7 +758,7 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
                                     : ((const uint2*) (lat + (size_t) KV * cell))[c4];
         }
         __syncthreads();
-        for (int s = 0; s < MB_CH; ++s) {
+        for (int s = 0; s < MB_CH_USE; ++s) {
             float a0 = 0.0f, a1 = 0.0f;
 #pragma unroll
             for (int j = 0; j < 16; ++j) {
@@ -765,12 +778,12 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
 #pragma unroll
         for (int hh = 0; hh < 2; ++hh) {
             const int h = 2 * warp + hh;
-            const float v = sP[h * MB_CH + lane];
+            const float v = (lane < MB_CH_USE) ? sP[h * MB_CH + lane] : -INFINITY;
             const float m_old = s_m[h];
             const float m_new = fmaxf(m_old, warp_max(v));
             const float e = (v == -INFINITY) ? 0.0f : expf(v - m_new);
             const float l = warp_sum(e);
-            sP[h * MB_CH + lane] = e;
+            if (lane < MB_CH_USE) sP[h * MB_CH + lane] = e;
             __syncwarp();
             if (lane == 0) {
                 const float sc = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
@@ -786,7 +799,7 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
             acc0[hh] *= sc;
             acc1[hh] *= sc;
         }
-        for (int s = 0; s < MB_CH; ++s) {
+        for (int s = 0; s < MB_CH_USE; ++s) {
             const float l0 = lat_f(sL[s * KV + tid]), l1 = lat_f(sL[s * KV + tid + 256]);
 #pragma unroll
             for (int hh = 0; hh < MB_HG; ++hh) {
