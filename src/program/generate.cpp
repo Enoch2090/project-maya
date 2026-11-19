@@ -1728,6 +1728,12 @@ static int glm_pack_generate(const Options& o) {
     const bool multi_ckpts = model.seq_count() > 1 && env_num("MAYA_GLM_MULTI_CKPTS", 0) != 0;
     const int ckpt_max = [&] {
         if (!model.fast() || getenv("MAYA_GLM_NO_REUSE") != nullptr) return 0;
+        // --prompt-cache 0: no conversation is kept between requests ("read every prompt from the start"), so a
+        // checkpoint has nothing to serve - and its marks are not free.  A mark ends a prompt-path call
+        // (prefill_run), and every call fills and drains the four parts' pipeline: a 32K prompt cut at its turn
+        // boundaries is 16384 + 9949 + 1638 + 4796, four calls at 372 / 303 / 103 / 207 tok/s, against one call of
+        // four 8192-token chunks at 514 (measured, 4x MTT S4000, Maya-S-v2-IQ2_XXS).  Not kept, so not marked.
+        if (o.prompt_cache <= 0) return 0;
         const int want = std::max(0, std::min(16, (int) env_num("MAYA_GLM_CKPTS", 4)));
         if (model.seq_count() <= 1) return want;
         if (!multi_ckpts) return 0;
@@ -2017,7 +2023,7 @@ static int glm_pack_generate(const Options& o) {
             // runs there the same way: with several conversations the slot serves the other contexts too, which a
             // context's own checkpoints cannot.)
             // MAYA_GLM_PREFIX_CUT=0: off
-            static const bool prefix_cut_on = env_num("MAYA_GLM_PREFIX_CUT", 1) != 0;
+            static const bool prefix_cut_on = env_num("MAYA_GLM_PREFIX_CUT", 1) != 0 && o.prompt_cache > 0;
             if (ckpt_max <= 0 && slot_max > 0 && prefix_cut_on && cur_img_pos.empty())
                 strata::core::add_mark(marks, strata::core::prefix_cut(prompt.data(), prompt.size(), reuse, slot_min,
                                                                         154827), reuse);
@@ -5008,9 +5014,17 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (!o.glm_pack.empty()) {
-        // GLM without --kv: INT8, as the setup writes it (v1.1.55: KL against the full model within FP16's own
-        // run-to-run spread, no new loops; half the latent cache's VRAM); --kv fp16 or MAYA_GLM_KV_INT8=0 keeps FP16
+        // GLM without --kv: FP16.  The setup writes INT8 (v1.1.55: KL against the full model within FP16's own
+        // run-to-run spread, no new loops; half the latent cache's VRAM), but on MUSA the INT8 latent cache is read
+        // through a per-cell lat8_h4() dequantization in glm_batch.cu's staging instead of a 16-byte copy: measured
+        // here, dropping it takes dsa_attn's staging from 173.8 to 147.8 ms (-15%), worth 5.1% end to end at 128K
+        // (998 -> 1048.6 tok/s) and 784.5 at 32K.  The FP16 cache costs 0.12-0.18 GB of state per card and leaves
+        // the expert pool untouched (21.55 GB, 397 slots a layer).  --kv int8 or MAYA_GLM_KV_INT8=1 restores it.
+#if defined(STRATA_USE_MUSA)
+        if (!o.kv_given && std::getenv("MAYA_GLM_KV_INT8") == nullptr) o.kv = "fp16";
+#else
         if (!o.kv_given && std::getenv("MAYA_GLM_KV_INT8") == nullptr) o.kv = "int8";
+#endif
         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
         if (o.kv == "int8" && std::getenv("MAYA_GLM_KV_INT8") == nullptr) set_env("MAYA_GLM_KV_INT8", "1");
         // --kv-resident N: KV streaming of the DSA latent cache (Glm5Model::kv_resident_cells, read at load)

@@ -199,6 +199,84 @@ __global__ void pack_heads_f16(const float* __restrict__ src, uint16_t* __restri
         dst[i] = __half_as_ushort(__float2half(src[((int64_t) t * H + h) * K + k]));
     }
 }
+// rows_f16 of the EXL3 kernels (src row idx[r] -> dst row r, F32 to FP16) - as a kernel of this file, because a
+// MUSA build links exl3_stub_musa.cpp in place of exl3.cu (cmake/musa_backend.cmake: mcc's device pass does not
+// finish on exl3.cu) and that stub's rows_f16 returns without writing a byte.  The FP16 expert products below read
+// their activations through it, so on MUSA the stub silently multiplied uninitialized memory: this is the same
+// function, compiled here.  idx == nullptr: dst row r is src row r (the down product's h rows, already gathered).
+__global__ void rows_f16_gather(const float* __restrict__ x, int ldx, const int* __restrict__ idx, int ncols,
+                                uint16_t* __restrict__ out) {
+    const int r = blockIdx.y;
+    const float* src = x + (size_t) (idx != nullptr ? idx[r] : r) * (size_t) ldx;
+    uint16_t* dst = out + (size_t) r * (size_t) ncols;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < ncols; c += gridDim.x * blockDim.x)
+        dst[c] = __half_as_ushort(__float2half_rn(src[c]));
+}
+// R40: the merged batch's two remaining per-expert steps - the swiglu and the output copy - as ONE launch
+// each over the batch's EXACT rows, instead of one launch an expert.  (The activation gather keeps the
+// per-expert form: research/r40/exact.mu proves these two bit-identical to their per-expert originals but
+// could not settle the gather's own reference in this round, so it was left alone.)
+// The launch count is what this buys.  The resident phase's stream idles res_deq_pre = 2607 / 8877 /
+// 11020 / 9382 ms on CUDA0/1/2/3 (3.3 / 8.5 / 10.6 / 9.5% of every card's stream), and that idle is
+// INVARIANT to the batch count but proportional to the EXPERT count: TILE=512 cut CUDA1's batches
+// 18090 -> 6467 and res_deq_pre stayed at 8852 ms while the expert count went 49141 -> 49145.  The host's
+// issue rate on this backend is ~16 us a launch (research/r40/issue.mu: a single-block empty kernel is
+// 16.46 us a call on a drained queue, 4.13 us when the queue is kept warm - and res_deq_pre IS the drained
+// window).  The loop issued 4 launches an expert-slot (gather, swiglu, F32->F16, copyout) plus 2 mublas a
+// batch: 789616 over four cards for the 165362 slots of a 128K prompt.  Merging these two drops it to
+// 357614, and measured 1068.5 -> 1089.8 tok/s (1.0199x, twice each way).
+// the batch's prefix row bounds, carried as a kernel ARGUMENT: at most 17 ints, so every launch holds its own
+// copy.  (A device buffer would need a host staging array, and that array would be shared by the four
+// prefill threads and reused a batch later while the previous upload was still in flight.)
+struct BatchRows {
+    int hb[17];
+    int nb, maxr;
+    __device__ int start(int e) const { return hb[e]; }
+    __device__ int rows(int e) const { return hb[e + 1] - hb[e]; }
+};
+// the swiglu over the batch's exact rows, reading/writing the expert-strided staging (stride 2 nff in, nff out)
+__global__ void swiglu_rows_batch(const float* __restrict__ gu, uint16_t* __restrict__ h16, BatchRows b, int nff,
+                                  float cap) {
+    const int e = (int) (blockIdx.y / (unsigned) b.maxr), r = (int) (blockIdx.y % (unsigned) b.maxr);
+    if (e >= b.nb || r >= b.rows(e)) return;
+    const size_t row = (size_t) e * (size_t) b.maxr + (size_t) r;
+    const float* g = gu + row * (size_t) (2 * nff);
+    uint16_t* o = h16 + row * (size_t) nff;
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < nff; j += gridDim.x * blockDim.x) {
+        // (exactly glm_batch.cu:2160's swiglu_rows_kernel: clamp g and u individually, then multiply)
+        const float gv = fminf(g[j], cap);
+        const float uv = fminf(fmaxf(g[nff + j], -cap), cap);
+        o[j] = __half_as_ushort(__float2half_rn((gv / (1.0f + expf(-gv))) * uv));
+    }
+}
+// the batch's exact rows into their OUTP window rows (contiguous in the window, see `contiguous`)
+__global__ void copyout_batch(const float* __restrict__ y, float* __restrict__ outp, BatchRows b, int dst_base,
+                              int E_) {
+    const int e = (int) (blockIdx.y / (unsigned) b.maxr), r = (int) (blockIdx.y % (unsigned) b.maxr);
+    if (e >= b.nb || r >= b.rows(e)) return;
+    const float* src = y + ((size_t) e * (size_t) b.maxr + (size_t) r) * (size_t) E_;
+    float* dst = outp + (size_t) (dst_base + b.start(e) + r) * (size_t) E_;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < E_; c += gridDim.x * blockDim.x) dst[c] = src[c];
+}
+// MAYA_GLM_ROWS_F16=0: the EXL3 kernels' own rows_f16 (the MUSA build's stub, which writes nothing) - the A/B
+// control for this fix, kept because the difference is not a slowdown but a different (wrong) result.
+static bool rows_f16_stub() {
+    static const bool stub = [] {
+        const char* v = getenv("MAYA_GLM_ROWS_F16");
+        return v != nullptr && v[0] != ' ' && std::atoi(v) == 0;
+    }();
+    return stub;
+}
+static inline void rows_f16_portable(const float* x, int ldx, const int* idx, int nrows, int ncols, uint16_t* out,
+                                     cudaStream_t s) {
+    if (nrows <= 0 || ncols <= 0) return;
+    if (rows_f16_stub()) {
+        strata::kernels::exl3::rows_f16(x, ldx, idx, nrows, ncols, out, s);   // (the no-op this replaced)
+        return;
+    }
+    rows_f16_gather<<<dim3((unsigned) std::min(8, (ncols + 255) / 256), (unsigned) nrows), 256, 0, s>>>(x, ldx, idx,
+                                                                                                       ncols, out);
+}
 __global__ void bf16_to_f16(const uint16_t* __restrict__ src, uint16_t* __restrict__ dst, int64_t n) {
     for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
         dst[i] = __half_as_ushort(__float2half(__uint_as_float((uint32_t) src[i] << 16)));
@@ -245,7 +323,23 @@ bool wmma_env_on() {
     return want;
 }
 bool moe_wmma_on(int gu_type, int d_type, int E, int nff) {
-#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
+#if defined(STRATA_USE_MUSA)
+    // The grouped FP16 tensor-core products, which upstream kept to sm_70+ because it gated their bodies on
+    // __CUDA_ARCH__ >= 700 - a macro mcc does not define, so on this backend they compiled to empty kernels and the
+    // GPU took the FP16-dequantize-to-global + cuBLAS path instead.  With the body reachable (iq_kernels.cu's
+    // GLMF_WG_TC) the fused product replaces, per expert and per prompt chunk, a 50 MB FP16 write of that expert's
+    // weights: measured 174 GB written a chunk, 24 GB read, 98 GB/s effective - 1776 ms of a 1975 ms fixed cost.
+    // MAYA_PF_WMMA=0 keeps the dequantize + cuBLAS path (for A/B and as the fallback).
+    if (!wmma_env_on()) return false;
+    if (E % 256 != 0) return false;
+    // gate/up decodes in 256-value chunks off a 256-value superblock; down in 128-value halves
+    const bool gu_ok = (gu_type == 16 || gu_type == 18 || gu_type == 21 || gu_type == 22 || gu_type == 23);
+    const bool dn_ok = (d_type == 18 || d_type == 21 || d_type == 22) && nff % 256 == 0;
+    if (!gu_ok || !dn_ok) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    return strata::kernels::gemm_iq_f16_grouped_supported(dev);
+#elif (defined(STRATA_USE_HIP))
     (void) gu_type; (void) d_type; (void) E; (void) nff;
     return false;
 #else
@@ -359,13 +453,23 @@ DenseBufs carve_dense(Carve& c, size_t T, const Glm5Geometry& g) {
 // tokens) and the light kernels' most; never more than the chunk routes.
 // (MAYA_GLM_PREFILL_WINDOW=<rows> sets it, at least the floor; 0 = every routed row, the layout before the window)
 int moe_window_rows(size_t T, const Glm5Geometry& g) {
+    // R23: the whole layer's rows, not the structural floor.  The resident experts' ONE strided-batched product
+    // only runs when the batch fits the open window (glm_prefill.cu's flush_batch: `w_hi == first_a &&
+    // last_end - wb <= W`); anything else drops to a per-expert cuBLAS GEMM.  At the old floor
+    // max(T, kLightMax*kLightRows) = 21824 rows a 8192-token chunk held 5.98 batches of 16 experts, so each
+    // layer's 18 batches needed three windows and the misses cost 812 ms of CUDA1's 11312 ms resident phase.
+    // Measured with the profiler's sub-phase marks, one variable (MAYA_GLM_PREFILL_WINDOW 21824 -> 0), twice:
+    // that fallback 812.4 -> 111.0 ms (-86.3%), the phase 11425 -> 11090 ms (-2.9%), end to end 653 -> 658 /
+    // 658 tok/s (32K) and 877 -> 884 (128K).  Every other sub-phase moves +9% at most: it absorbs the rows the
+    // fallback used to take.  The arena is floored by the layout either way, so the footprint is unchanged.
+    // (MAYA_GLM_PREFILL_WINDOW=<rows> still overrides, at least the structural floor.)
     const size_t all = T * (size_t) g.n_exp_used, floor = std::max(T, (size_t) kLightMax * kLightRows);
     static const long long env = [] {
         const char* v = getenv("MAYA_GLM_PREFILL_WINDOW");
         return v ? std::atoll(v) : -1LL;
     }();
     if (env == 0) return (int) all;
-    return (int) std::min(all, env > 0 ? std::max(floor, (size_t) env) : floor);
+    return (int) std::min(all, env > 0 ? std::max(floor, (size_t) env) : all);
 }
 
 // the MoE runs on the WHOLE chunk (every expert's weights are read once per chunk); the shared expert in sub-batches
@@ -427,7 +531,23 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
 // ones than the mixers; MAYA_GLM_PREFILL_SH_SUB overrides, sub_env sets it
 int shexp_sub(int sub_env) {
     if (sub_env > 0) return sub_env;
-#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
+#if defined(STRATA_USE_MUSA)
+    // R25: the whole chunk, the same way mixer_sub does it on this backend - and for exactly the reason that
+    // function's comment already spelled out: "the mixers' projections AND THE SHARED EXPERT are dequantized to
+    // FP16 once a sub-batch".  This branch still returned kSub = 256, so the shared expert alone re-dequantized
+    // its three matrices (gate/up/down, 25.2 M values, 50.3 MB of FP16 written) once a 256-token sub-batch: 32
+    // times a chunk, 384 times a chunk across the 12 layers, 21.8 GB of pure rewrite where 0.68 GB is the real
+    // work.  Measured, 32K prompt, strictly alternating, one variable (MAYA_GLM_PREFILL_SUB, which leaves
+    // mixer_sub at its own 8192 default and so moves only this): shexp 2911.5 -> 330.1 ms (8.82x) with no other
+    // profiler line moving past noise, and end to end 675/675 -> 738/738 tok/s (1.093x).  carve_moe's
+    // std::min(T, sub) clamps the last sub-batch, and the buffers grow with it, as they already do for the
+    // mixers' 8192.
+    static const int v = [] {
+        const char* e = getenv("MAYA_GLM_PREFILL_SH_SUB");
+        return e ? std::clamp(std::atoi(e), 16, 8192) : 8192;
+    }();
+    return v;
+#elif defined(STRATA_USE_HIP)
     return kSub;
 #else
     static const int v = [] {
@@ -595,7 +715,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
     uint16_t* X16 = L.w16 + wgu;
     for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
         const int n = std::min(gu_rows, nrows - c0);
-        x3::rows_f16(L.x, E, L.row_tok + r0 + a + c0, n, E, X16, s);
+        rows_f16_portable(L.x, E, L.row_tok + r0 + a + c0, n, E, X16, s);
         blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, L.w16, CUDA_R_16F, E,
                              X16, CUDA_R_16F, E, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
                              CUBLAS_GEMM_DEFAULT_TENSOR_OP),
@@ -606,7 +726,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
     uint16_t* H16 = L.w16 + wdn;
     for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
         const int n = std::min(dn_rows, nrows - c0);
-        x3::rows_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, H16, s);
+        rows_f16_portable(GU + (size_t) c0 * E, E, nullptr, n, nff, H16, s);
         blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, L.w16, CUDA_R_16F, nff, H16,
                              CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
                              CUBLAS_GEMM_DEFAULT_TENSOR_OP),
@@ -3801,6 +3921,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // the Volta grouped-WMMA products for this layer (MAYA_PF_WMMA): the run_set's branch below converts the
         // activations to FP16 and runs both products on the tensor cores; a rejected launch falls back to MMQ once
         const bool wmma = moe_wmma_on(Ly.gu_type, Ly.d_type, E, nff);
+
         static bool wmma_fell_back = false;
         // the FP16 products of a matrix MMQ cannot multiply (expert_f16: IQ1_M; on a V100 a type without sm_70 code),
         // the layer's other matrix on MMQ as in any layer: each routed expert's matrix dequantized to FP16 (convert.cu)
@@ -3835,7 +3956,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 mmq::to_f16(Ly.gu_type, wbase + (size_t) i * stride, S->w16, f16_wgu, s);
                 for (int c0 = 0; c0 < n_i; c0 += cap) {
                     const int n = std::min(cap, n_i - c0);
-                    x3::rows_f16(S->x, E, M.row_tok + r0 + hb[i] + c0, n, E, X16, s);
+                    rows_f16_portable(S->x, E, M.row_tok + r0 + hb[i] + c0, n, E, X16, s);
                     blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, S->w16, CUDA_R_16F, E,
                                          X16, CUDA_R_16F, E, &zero, GU + (size_t) (hb[i] - a + c0) * (2 * nff),
                                          CUDA_R_32F, 2 * nff, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
@@ -3861,7 +3982,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     const int c0 = b * cap, n = std::min(cap, n_i - c0), k = hb[i] - a + c0;
                     const float* h = GU + (size_t) k * (2 * nff);
                     float* Y = Y0 + (size_t) k * E;
-                    x3::rows_f16(h, 2 * nff, nullptr, n, nff, H16, s);
+                    rows_f16_portable(h, 2 * nff, nullptr, n, nff, H16, s);
                     if (guard) glmd::f16_guard_rows(h, 2 * nff, 0, 1, nff, n, H16, s);
                     blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff,
                                          H16, CUDA_R_16F, nff, &zero, Y, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
@@ -3916,7 +4037,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         // the set's from a and the activations start a rows back, as in the MMQ products' trick.
                         auto* x16 = reinterpret_cast<uint16_t*>(M.Xq) - (size_t) a * E;
                         auto* h16 = reinterpret_cast<uint16_t*>(M.Hq) - (size_t) a * nff;
-                        strata::kernels::exl3::rows_f16(S->x, E, M.row_tok + r0 + a, nrows, E, x16 + (size_t) a * E, s);
+                        rows_f16_portable(S->x, E, M.row_tok + r0 + a, nrows, E, x16 + (size_t) a * E, s);
                         if (!strata::kernels::gemm_iq_f16_grouped(Ly.gu_type, wbase + (size_t) i0 * stride, stride,
                                 2 * nff, E, x16, E, d_bounds + i0, i1 - i0, max_rows, GU - (size_t) a * (2 * nff),
                                 2 * nff, s)) {
@@ -4021,9 +4142,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (env >= 0) return env;
 #if defined(STRATA_USE_MUSA)
             // MUSA measured: MMQ's prompt path runs its int8 dots through the shared-memory-poor FMA tier and is
-            // ~3x slower than the FP16 products (8K prompt: 59 vs 267 tok/s).  Take the FP16 path from the same
-            // 128-row threshold the sm_70 rule uses - every expert an 8K chunk routes has far more rows than that.
-            return 128;
+            // ~3x slower than the FP16 products (8K prompt: 59 vs 267 tok/s).  The threshold was sm_70's 128 on the
+            // assumption that "every expert an 8K chunk routes has far more rows than that" - it does on average
+            // (227 rows expert over a 32K prompt at 8K chunks), but the routing distribution's low tail is long:
+            // a layer routes 288 experts and the whole low tail went to MMQ.  Measured on a 32K prompt, one
+            // variable (MAYA_GLM_PREFILL_BLAS), 8192-token chunks: 128 -> 527 tok/s, 64 -> 541, 32 -> 549, 16 ->
+            // 553, 8 -> 555, 4 -> 556, 2 -> 556, 1 -> 556, 0 (MMQ only) -> 515.  So the FP16 path wins for every
+            // expert the chunk routes and the threshold's job is only to keep a product large enough to fill the
+            // SMs: 1 is the measured floor and the curve is flat from 8 down (research/r21/blas2|blas3).
+            // 1 is the smallest value that still means "the FP16 path is on": every expert a chunk routes has one
+            // row or more, so every one of them takes it (0 would turn the FP16 path off entirely - the 515 above).
+            return 1;
 #elif defined(STRATA_USE_HIP)
             return 0;   // (MMQ only: the FP16 path is measured on Volta)
 #else
@@ -4042,7 +4171,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }();
         const bool use_blas = blas_rows > 0 && !Ly.exl3 && mmq::to_f16_supported(Ly.gu_type) &&
                               mmq::to_f16_supported(Ly.d_type) && S->w16_mmq_elems >= (int64_t) 2 * nff * E + E;
-        const auto run_blas_q = [&](const uint8_t* blob, int a, int nrows, int r0) {
+        // MAYA_GLM_PREFILL_BATCH_REUSE=1: run_blas_q's own body (window placement, G2, swiglu, both GEMMs - every
+        // step that is known to be right), but its weight dequantization reads a batch staging buffer that the
+        // caller filled once for several experts, instead of dequantizing the blob again for each of them.
+        struct BlasBulk { const uint16_t* gu = nullptr; const uint16_t* dn = nullptr; };
+        const auto run_blas_q_reuse = [&](const uint8_t* blob, int a, int nrows, int r0, const BlasBulk* blk) {
             namespace x3 = strata::kernels::exl3;
             const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
             // (the scratch as it was before the FP16 expert products' room: this rule's GEMMs as without them)
@@ -4056,40 +4189,96 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             // written at stride n_embd and read at 2 n_ff broke every heavy expert of a long glm-dsa prompt.)
             const int ldg = 2 * nff;
             float* G2 = GU + (size_t) nrows * (size_t) (E - ldg);
-            mmq::to_f16(Ly.gu_type, blob, S->w16, wgu, s);
+            const uint16_t* WGU = S->w16;
+            if (blk != nullptr) WGU = blk->gu;
+            else mmq::to_f16(Ly.gu_type, blob, S->w16, wgu, s);
             uint16_t* X16 = S->w16 + wgu;
             for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
                 const int n = std::min(gu_rows, nrows - c0);
-                x3::rows_f16(S->x, E, M.row_tok + r0 + a + c0, n, E, X16, s);
-                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, S->w16, CUDA_R_16F, E,
+                rows_f16_portable(S->x, E, M.row_tok + r0 + a + c0, n, E, X16, s);
+                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, WGU, CUDA_R_16F, E,
                                      X16, CUDA_R_16F, E, &zero, G2 + (size_t) c0 * ldg, CUDA_R_32F, ldg,
                                      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                         "gemm q gate/up");
             }
             gb::swiglu_rows(G2, G2, nrows, nff, g.swiglu_exp, s, 2 * nff);
-            mmq::to_f16(Ly.d_type, blob + Ly.down_off, S->w16, wdn, s);
+            const uint16_t* WDN = S->w16;
+            if (blk != nullptr) WDN = blk->dn;
+            else mmq::to_f16(Ly.d_type, blob + Ly.down_off, S->w16, wdn, s);
             uint16_t* H16 = S->w16 + wdn;
             for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
                 const int n = std::min(dn_rows, nrows - c0);
-                x3::rows_f16(G2 + (size_t) c0 * ldg, ldg, nullptr, n, nff, H16, s);
-                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff, H16,
+                rows_f16_portable(G2 + (size_t) c0 * ldg, ldg, nullptr, n, nff, H16, s);
+                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, WDN, CUDA_R_16F, nff, H16,
                                      CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
                                      CUBLAS_GEMM_DEFAULT_TENSOR_OP),
                         "gemm q down");
             }
         };
-        // ---- the batched FP16 expert products (MAYA_GLM_PREFILL_BATCH=1) -------------------------------
-        // One submission per kB experts instead of one per expert.  A per-expert GEMM at ~227 rows leaves most of
-        // the card idle (measured on this hardware: 10.2 TFLOP/s per expert against 74.6 with one batched call for
-        // the layer), because each call has only a few dozen thread blocks.  The weights are dequantized into one
-        // contiguous block per matrix and the activation rows are padded to max_rows per expert, so a single
-        // strided-batched GEMM covers the batch; the padded rows of the output are never read (each expert's
-        // nrows are copied into the window that place() returns).  Staging is per device and reused.
+        // ---- batched weight staging (MAYA_GLM_PREFILL_BATCH=1) ----
+        // The only cost a per-expert product pays once per expert is its weight dequantization.  This batch
+        // dequantizes kB experts' gate/up and down weights into one staging block each, then runs the SAME
+        // single-expert body (run_blas_q_reuse) for each of them - window placement, G2 packing, swiglu, both
+        // GEMMs, unchanged.  Nothing in the arithmetic moves; only the dequantization is shared.
+        // Default ON: the batch shares each expert's weight dequantization and issues ONE
+        // mublasGemmStridedBatchedEx for the batch's two products (verified bit-identical to a per-expert
+        // cublasGemmEx over the same staged operands).  MAYA_GLM_PREFILL_BATCH=0: the per-expert products.
         const bool batch_f16 = [] {
             const char* v = getenv("MAYA_GLM_PREFILL_BATCH");
-            return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+            return v == nullptr || v[0] == 0 || std::atoi(v) != 0;
         }();
         constexpr int kB = 4, kRowCap = 512;
+        // The batch cap the flush loop below uses: MAYA_GLM_PREFILL_BATCH_N (1..32), else kB.  The staging buffers
+        // are sized by THIS, not by kB - a cap larger than the allocation dequantized past its end (BATCH_N=16 hung
+        // the card at layer 3 until the serve watchdog stopped the engine).
+        const int kBatchCap = [] {
+            const char* v = getenv("MAYA_GLM_PREFILL_BATCH_N");
+            const int n = v != nullptr ? std::atoi(v) : 0;
+            return n > 0 ? std::min(n, 32) : 0;
+        }();
+        // R30: the merged GEMM's ROW-PANEL band.  On by default at 256, the measured panel size.
+        // mublasGemmStridedBatchedEx prices a strided-batched call in ceil(M/256) row panels, not in
+        // rows: at nb=16 M=256 is 1.840 ms and M=257 is 3.535 ms (research/r30/step.mu, 7 reps), and
+        // the jump is at exactly 256 and 512 with the output width doubled (research/r30/tile_check.mu),
+        // so it is a ROW panel and not a work total.  M is max_rows, so one 257-512 row expert makes
+        // every member of its batch pay the second panel.  Measured on a 32K prompt, one variable,
+        // twice each: 256 -> 744.1 / 744.5 tok/s against 0 (off) -> 738.7 / 738.1.  The sweep
+        // 128 / 192 / 256 / 384 / 512 gives 711.7 / 727.5 / 744.1 / 737.6 / 738.6, i.e. the optimum
+        // sits exactly on the panel size - 192 and 384 both cut inside a panel and pay the extra calls.
+        // MAYA_GLM_PREFILL_TILE=<rows> overrides it, 0 = the earlier behaviour.
+        static const int tile_rows = [] {
+            const char* v = getenv("MAYA_GLM_PREFILL_TILE");
+            const int n = v != nullptr ? std::atoi(v) : 256;
+            return n > 0 ? n : 0;
+        }();
+        // R40: issue the merged batch's three non-GEMM steps as ONE launch a batch over the batch's exact rows
+        // instead of one launch an expert.  See the kernels' comment: the resident phase's stream idle
+        // (res_deq_pre, 3.3-10.6% of every card) is invariant to the batch count and proportional to the
+        // expert count, i.e. it is the host's issue rate on ~3 launches an expert.  MAYA_GLM_PREFILL_BATCH1D=0
+        // restores the per-expert launches (the A/B control).
+        static const bool batch1d = [] {
+            const char* v = getenv("MAYA_GLM_PREFILL_BATCH1D");
+            return v == nullptr || v[0] == 0 || std::atoi(v) != 0;
+        }();
+        // MAYA_GLM_PREFILL_BATCH_MERGED=0: the per-expert products (for A/B).  On by default, because the
+        // dequantization sharing alone measured nothing (514 vs 513 tok/s): what the microbench's 2.05-3.34x is
+        // ONE mublasGemmStridedBatchedEx filling the SMs, where a single expert's ~225-row product leaves most
+        // of them idle (10.2 against 74.6 TFLOP/s).
+        const bool batch_merged = [] {
+            const char* v = getenv("MAYA_GLM_PREFILL_BATCH_MERGED");
+            return v == nullptr || v[0] == 0 || std::atoi(v) != 0;
+        }();
+        // R41: does a one-expert batch take the merged strided call (default) or the run_blas_q_reuse fallback?
+        // The census puts 32317 singletons among the resident experts' 165464, and at 0.310 against 0.733 ms an
+        // expert that is the single largest identified item in the resident phase.  MAYA_GLM_PREFILL_BATCH_NB1=0
+        // is the A/B control: the fallback exactly as R40 left it.
+        static const bool batch_nb1 = [] {
+            const char* v = getenv("MAYA_GLM_PREFILL_BATCH_NB1");
+            return v == nullptr || v[0] == 0 || std::atoi(v) != 0;
+        }();
+        // the experts a batch holds: MAYA_GLM_PREFILL_BATCH_N, else 16 when merged (the microbench's 3.34x knee),
+        // else kB.  The staging below is sized by THIS one number.
+        const int bn_alloc = kBatchCap > 0 ? kBatchCap : (batch_merged ? 16 : kB);
         struct BatchStage { uint16_t *wgu, *wdn, *x16, *h16; float *gu, *y; };
         static BatchStage g_bs[16] = {};
         const auto batch_stage = [&]() -> BatchStage& {
@@ -4099,177 +4288,106 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             BatchStage& b = g_bs[dev];
             if (b.wgu == nullptr) {
                 const size_t gu_elems = (size_t) 2 * nff * E, dn_elems = (size_t) E * nff;
-                const struct { void** p; size_t bytes; const char* what; } req[] = {
-                    {(void**) &b.wgu, (size_t) kB * gu_elems * sizeof(uint16_t), "wgu"},
-                    {(void**) &b.wdn, (size_t) kB * dn_elems * sizeof(uint16_t), "wdn"},
-                    {(void**) &b.x16, (size_t) kB * kRowCap * E * sizeof(uint16_t), "x16"},
-                    {(void**) &b.h16, (size_t) kB * kRowCap * nff * sizeof(uint16_t), "h16"},
-                    {(void**) &b.gu, (size_t) kB * kRowCap * 2 * nff * sizeof(float), "gu"},
-                    {(void**) &b.y, (size_t) kB * kRowCap * E * sizeof(float), "y"},
+                const size_t nb = (size_t) bn_alloc;
+                // the merged call stages the activations and both products per expert as well:
+                // x16 [nb][kRowCap][E], h16 [nb][kRowCap][nff], gu [nb][kRowCap][2 nff], y [nb][kRowCap][E]
+                const struct { void** p; size_t bytes; } req[] = {
+                    {(void**) &b.wgu, nb * gu_elems * sizeof(uint16_t)},
+                    {(void**) &b.wdn, nb * dn_elems * sizeof(uint16_t)},
+                    {(void**) &b.x16, nb * (size_t) kRowCap * (size_t) E * sizeof(uint16_t)},
+                    {(void**) &b.h16, nb * (size_t) kRowCap * (size_t) nff * sizeof(uint16_t)},
+                    {(void**) &b.gu, nb * (size_t) kRowCap * (size_t) (2 * nff) * sizeof(float)},
+                    {(void**) &b.y, nb * (size_t) kRowCap * (size_t) E * sizeof(float)},
                 };
                 for (const auto& r : req) {
-                    const cudaError_t e = cudaMalloc(r.p, r.bytes);
-                    if (e != cudaSuccess) {
-                        std::fprintf(stderr, "glm prefill: batch staging %s (%zu B) failed: %s\n", r.what, r.bytes,
-                                     cudaGetErrorString(e));
-                        b.wgu = nullptr;
-                        return b;
+                    if (cudaMalloc(r.p, r.bytes) != cudaSuccess) {
+                        std::fprintf(stderr, "glm prefill: batch staging failed (%zu bytes)\n", r.bytes);
+                        cudaGetLastError();
+                        b.wgu = nullptr;   // (the single-expert product runs instead)
+                        break;
                     }
                 }
             }
             return b;
         };
         struct BItem { const uint8_t* blob; int a; int nrows; };
-        const auto run_blas_batch = [&](const std::vector<BItem>& its, int r0) {
-            namespace x3 = strata::kernels::exl3;
-            const int nb = (int) its.size();
-            int max_rows = 0;
-            for (const BItem& it : its) max_rows = std::max(max_rows, it.nrows);
-            BatchStage& b = batch_stage();
-            if (b.wgu == nullptr) {   // (no staging: the single-expert product still works)
-                for (const BItem& it : its) run_blas_q(it.blob, it.a, it.nrows, r0);
-                return;
-            }
-            const size_t gu_elems = (size_t) 2 * nff * E, dn_elems = (size_t) E * nff;
-            // Claim the output window BEFORE computing, as the single-expert product does.  The batch's experts are
-            // consecutive sorted rows (the caller breaks the batch wherever the run of heavy experts does), so
-            // place() only extends the window and never flushes here - and every row it returns is written by the
-            // copies at the end, before the caller's next flush reads it.  Computing first and placing afterwards
-            // let a flush at the window boundary read rows that were not written yet.
-            // The window must hold the whole batch: place() flushes whatever it holds when the next run does not fit,
-            // and a flush of rows this batch has not written yet feeds garbage into ffn.  The caller keeps batches
-            // inside one window, and this check refuses (falls back) if that ever stops being true.
-            const int first_a = r0 + its.front().a;
-            const int last_end = r0 + its.back().a + its.back().nrows;
-            if (!(w_hi > w_lo && first_a == w_hi && last_end - first_a <= W)) {
-                for (const BItem& it : its) run_blas_q(it.blob, it.a, it.nrows, r0);
-                return;
-            }
-            auto off = std::vector<int>(its.size());
-            for (int k = 0; k < nb; ++k) off[(size_t) k] = place(r0 + its[(size_t) k].a, its[(size_t) k].nrows);
-            for (int k = 0; k < nb; ++k) {
-                mmq::to_f16(Ly.gu_type, its[(size_t) k].blob, b.wgu + (size_t) k * gu_elems, (int64_t) gu_elems, s);
-                mmq::to_f16(Ly.d_type, its[(size_t) k].blob + Ly.down_off, b.wdn + (size_t) k * dn_elems,
-                            (int64_t) dn_elems, s);
-            }
-            for (int k = 0; k < nb; ++k)
-                x3::rows_f16(S->x, (int) E, M.row_tok + r0 + its[(size_t) k].a, its[(size_t) k].nrows, (int) E,
-                             b.x16 + (size_t) k * (size_t) max_rows * (size_t) E, s);
-            static const bool legacy_gemm = [] {
-                const char* v = getenv("MAYA_GLM_PREFILL_BATCH_LEGACYGEMM");
-                return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
-            }();
-            // MAYA_GLM_PREFILL_BATCH_MODE=perexpert: the staging above (weights dequantized once per batch, the
-            // point of this path), but every expert still gets its own GEMM at its own row count - no padding, no
-            // strided batch.  Keeps the dequantization saving and the exact numeric shape of the single-expert
-            // product; used to separate the two effects when the batched call misbehaves.
-            static const bool perexpert = [] {
-                const char* v = getenv("MAYA_GLM_PREFILL_BATCH_MODE");
-                return v != nullptr && std::strcmp(v, "perexpert") == 0;
-            }();
-            if (perexpert) {
-                for (int k = 0; k < nb; ++k) {
-                    const int nr = its[(size_t) k].nrows, o = off[(size_t) k];
-                    float* GU = M.OUTP + (size_t) o * E;
-                    // (the same placement run_blas_q uses: gate/up at the END of the row block, ldg wide)
-                    const int ldg = 2 * (int) nff;
-                    float* G2 = GU + (size_t) nr * (size_t) (E - ldg);
-                    blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, ldg, nr, (int) E, &one,
-                                         b.wgu + (size_t) k * gu_elems, CUDA_R_16F, (int) E,
-                                         b.x16 + (size_t) k * (size_t) max_rows * (size_t) E, CUDA_R_16F, (int) E,
-                                         &zero, G2, CUDA_R_32F, ldg, CUBLAS_COMPUTE_32F,
-                                         CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                            "gemm batch gate/up (perexpert)");
-                    gb::swiglu_rows(G2, G2, nr, (int) nff, g.swiglu_exp, s, ldg);
-                    x3::rows_f16(G2, ldg, nullptr, nr, (int) nff,
-                                 b.h16 + (size_t) k * (size_t) max_rows * (size_t) nff, s);
-                    blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) E, nr, (int) nff, &one,
-                                         b.wdn + (size_t) k * dn_elems, CUDA_R_16F, (int) nff,
-                                         b.h16 + (size_t) k * (size_t) max_rows * (size_t) nff, CUDA_R_16F, (int) nff,
-                                         &zero, GU, CUDA_R_32F, (int) E, CUBLAS_COMPUTE_32F,
-                                         CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                            "gemm batch down (perexpert)");
-                }
-                return;
-            }
-            if (legacy_gemm) {
-                for (int k = 0; k < nb; ++k)
-                    blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) (2 * nff), its[(size_t) k].nrows,
-                                         (int) E, &one, b.wgu + (size_t) k * gu_elems, CUDA_R_16F, (int) E,
-                                         b.x16 + (size_t) k * (size_t) max_rows * (size_t) E, CUDA_R_16F, (int) E,
-                                         &zero, b.gu + (size_t) k * (size_t) max_rows * (size_t) (2 * nff),
-                                         CUDA_R_32F, (int) (2 * nff), CUBLAS_COMPUTE_32F,
-                                         CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                            "gemm batch gate/up (legacy)");
-                for (int k = 0; k < nb; ++k) {
-                    float* gk = b.gu + (size_t) k * (size_t) max_rows * (size_t) (2 * nff);
-                    gb::swiglu_rows(gk, gk, its[(size_t) k].nrows, (int) nff, g.swiglu_exp, s, (int) (2 * nff));
-                }
-                for (int k = 0; k < nb; ++k)
-                    x3::rows_f16(b.gu + (size_t) k * (size_t) max_rows * (size_t) (2 * nff), (int) (2 * nff), nullptr,
-                                 its[(size_t) k].nrows, (int) nff,
-                                 b.h16 + (size_t) k * (size_t) max_rows * (size_t) nff, s);
-                for (int k = 0; k < nb; ++k)
-                    blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) E, its[(size_t) k].nrows,
-                                         (int) nff, &one, b.wdn + (size_t) k * dn_elems, CUDA_R_16F, (int) nff,
-                                         b.h16 + (size_t) k * (size_t) max_rows * (size_t) nff, CUDA_R_16F, (int) nff,
-                                         &zero, b.y + (size_t) k * (size_t) max_rows * (size_t) E, CUDA_R_32F, (int) E,
-                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                            "gemm batch down (legacy)");
-                for (int k = 0; k < nb; ++k) {
-                    const int o = off[(size_t) k];
-                    cudaMemcpyAsync(M.OUTP + (size_t) o * (size_t) E,
-                                    b.y + (size_t) k * (size_t) max_rows * (size_t) E,
-                                    (size_t) its[(size_t) k].nrows * (size_t) E * sizeof(float),
-                                    cudaMemcpyDeviceToDevice, s);
-                }
-                return;
-            }
-            blas_ck(cublasGemmStridedBatchedEx(
-                        S->blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) (2 * nff), max_rows, (int) E, &one,
-                        b.wgu, CUDA_R_16F, (int) E, (long long) gu_elems,
-                        b.x16, CUDA_R_16F, (int) E, (long long) ((size_t) max_rows * (size_t) E),
-                        &zero, b.gu, CUDA_R_32F, (int) (2 * nff),
-                        (long long) ((size_t) max_rows * (size_t) (2 * nff)), nb, CUBLAS_COMPUTE_32F,
-                        CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                    "gemm batch gate/up");
-            for (int k = 0; k < nb; ++k) {
-                float* gk = b.gu + (size_t) k * (size_t) max_rows * (size_t) (2 * nff);
-                gb::swiglu_rows(gk, gk, its[(size_t) k].nrows, (int) nff, g.swiglu_exp, s, (int) (2 * nff));
-            }
-            for (int k = 0; k < nb; ++k)
-                x3::rows_f16(b.gu + (size_t) k * (size_t) max_rows * (size_t) (2 * nff), (int) (2 * nff), nullptr,
-                             its[(size_t) k].nrows, (int) nff,
-                             b.h16 + (size_t) k * (size_t) max_rows * (size_t) nff, s);
-            blas_ck(cublasGemmStridedBatchedEx(
-                        S->blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) E, max_rows, (int) nff, &one,
-                        b.wdn, CUDA_R_16F, (int) nff, (long long) dn_elems,
-                        b.h16, CUDA_R_16F, (int) nff, (long long) ((size_t) max_rows * (size_t) nff),
-                        &zero, b.y, CUDA_R_32F, (int) E, (long long) ((size_t) max_rows * (size_t) E), nb,
-                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                    "gemm batch down");
-            static const bool dbg_sync = [] {
-                const char* v = getenv("MAYA_GLM_PREFILL_BATCH_SYNC");
-                return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
-            }();
-            if (dbg_sync) cudaStreamSynchronize(s);
-            for (int k = 0; k < nb; ++k) {
-                const int o = off[(size_t) k];
-                cudaMemcpyAsync(M.OUTP + (size_t) o * (size_t) E,
-                                b.y + (size_t) k * (size_t) max_rows * (size_t) E,
-                                (size_t) its[(size_t) k].nrows * (size_t) E * sizeof(float),
-                                cudaMemcpyDeviceToDevice, s);
-            }
-            if (dbg_sync) cudaStreamSynchronize(s);
-        };
         // in set order: runs of lighter experts through MMQ (run_set over the run), the heavy ones through cuBLAS
         const auto run_set_q = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                    int r0) {
+            // !! NOT YET NUMERICALLY CORRECT - off unless MAYA_PF_WMMA=1, and it still produces non-finite router
+            // scores on a 32K prompt (round 2's open bug).  Everything under it is in place and independently
+            // verified (the tensor-core bodies compile and run on MUSA, iq_kernels.cu:GLMF_WG_TC; the IQ2_XXS
+            // 128-value half decoder is bit-exact against ggml, research/r6/deq_test.mu); the fault is in this
+            // wiring's frame/bounds contract.  See RALPH_STATE.md before touching it.
+            // The grouped FP16 tensor-core product (MAYA_PF_WMMA, MUSA): one launch for the whole run of experts,
+            // each weight chunk decoded into shared memory and multiplied on the tensor cores, so an expert's
+            // matrix is never written to global memory as FP16.  This is the branch that matters here - use_blas
+            // takes every run before run_set's own WMMA branch is ever reached.  A refused shape falls through.
+            if (wmma && !wmma_fell_back) {
+                // hb[i] is the run's sorted row start for expert i (expert i holds rows [hb[i], hb[i+1]));
+                // `a` is the run's base, so the activations start a rows back and the products' output rows are
+                // the run's own window rows [a, hb[n_exp]).  max_rows is the widest single expert of the run -
+                // gemm_iq_f16_grouped chunks each expert on its own bounds, it does not take the run's total.
+                // hb is the CHUNK's sorted row start for each of the run's experts (hb[i] here is the chunk-level
+                // index, not the run's).  The gathered activations must therefore start at the run's base a and the
+                // bounds handed to the product are hb's own values, shifted so index 0 is the run's first row.
+                const int a = hb[0];
+                const int nrows = hb[n_exp] - a;
+                int max_rows = 0;
+                for (int i = 0; i < n_exp; ++i) max_rows = std::max(max_rows, hb[i + 1] - hb[i]);
+                // Claim the output window BEFORE computing, as run_blas_q_reuse does: place() returns the run's
+                // offset into it and, when the run does not continue the open window, first adds what that window
+                // already holds into ffn.  Writing M.OUTP without claiming left moe_combine_add reading rows that
+                // no window covered (the "invalid expert ID or non-finite score" a 32K prompt hit).
+                const int o = place(r0 + a, nrows);
+                float* GU = M.OUTP + (size_t) o * E;
+                // activations for sorted rows [a, hb[n_exp]) of the chunk, gathered into rows 0..nrows of a frame
+                auto* x16 = reinterpret_cast<uint16_t*>(M.Xq);
+                auto* h16 = reinterpret_cast<uint16_t*>(M.Hq);
+                // (a device copy of the run-relative bounds, doubled-host -> device on this stream; the buffer is
+                // per-device and reused, and it is NOT M.bounds, which other products fill for their own launches)
+                static int* rel_dev[16] = {};
+                static int rel_cap[16] = {};
+                int dv = 0;
+                cudaGetDevice(&dv);
+                if (dv >= 0 && dv < 16) {
+                    if (rel_dev[dv] == nullptr || rel_cap[dv] < n_exp + 1) {
+                        if (rel_dev[dv] != nullptr) cudaFree(rel_dev[dv]);
+                        rel_cap[dv] = std::max(4096, n_exp + 1);
+                        if (cudaMalloc(&rel_dev[dv], (size_t) rel_cap[dv] * sizeof(int)) != cudaSuccess) {
+                            rel_dev[dv] = nullptr;
+                            wmma_fell_back = true;
+                        }
+                    }
+                }
+                if (rel_dev[dv] == nullptr) return;   // (fell back: the per-expert products run instead)
+                std::vector<int> rel((size_t) n_exp + 1);
+                for (int i = 0; i <= n_exp; ++i) rel[(size_t) i] = hb[i] - a;
+                cudaMemcpyAsync(rel_dev[dv], rel.data(), (size_t) (n_exp + 1) * sizeof(int), cudaMemcpyHostToDevice, s);
+                rows_f16_portable(S->x, E, M.row_tok + r0 + a, nrows, E, x16, s);
+                if (!strata::kernels::gemm_iq_f16_grouped(Ly.gu_type, wbase, stride, 2 * nff, E, x16, E, rel_dev[dv],
+                                                          n_exp, max_rows, GU, 2 * nff, s)) {
+                    wmma_fell_back = true;
+                    std::fprintf(stderr, "glm prefill: grouped WMMA rejected the gate/up shape, MMQ from here\n");
+                } else {
+                    // bounds are run-relative, so the product's row 0 is chunk row a, whose window home is GU:
+                    // the swiglu reads GU, and the down's rows land back in GU (row 0 -> GU + 0).
+                    gb::swiglu_rows_h16(GU, h16, nrows, nff, g.swiglu_exp, s);
+                    if (!strata::kernels::gemm_iq_f16_grouped(Ly.d_type, wbase + Ly.down_off, stride, E, nff, h16, nff,
+                                                              rel_dev[dv], n_exp, max_rows, GU, E, s)) {
+                        wmma_fell_back = true;
+                        std::fprintf(stderr, "glm prefill: grouped WMMA rejected the down shape, MMQ from here\n");
+                    } else {
+                        S->mark("moe_wmma", s);
+                        return;
+                    }
+                }
+            }
             if (!batch_f16) {
                 for (int i = 0; i < n_exp;) {
                     const int rows = hb[i + 1] - hb[i];
                     if (rows >= blas_rows) {
-                        run_blas_q(wbase + (size_t) i * stride, hb[i], rows, r0);
+                        run_blas_q_reuse(wbase + (size_t) i * stride, hb[i], rows, r0, nullptr);
                         ++i;
                     } else {
                         int j = i + 1;
@@ -4281,27 +4399,236 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 return;
             }
             std::vector<BItem> batch;
+            // R29 (MAYA_GLM_PREFILL_BATCH_STATS=1): the batch composition the merged product actually
+            // sees.  R28 charged the padded rows to "waste" without ever printing them; this counts the
+            // issue: 18 batches a layer, nb experts each, max_rows the widest, sum_rows what is useful.
+            static const bool bstats = getenv("MAYA_GLM_PREFILL_BATCH_STATS") != nullptr;
             const auto flush_batch = [&] {
                 if (batch.empty()) return;
-                run_blas_batch(batch, r0);
+                if (bstats) {
+                    int mx = 0, sum = 0;
+                    for (const BItem& it : batch) { mx = std::max(mx, it.nrows); sum += it.nrows; }
+                    // (thread_local: the four devices' prefill threads share this lambda body)
+                    static thread_local long long nb_ = 0, issued = 0, useful = 0, mxsum = 0, neu = 0;
+                    ++nb_; neu += (long long) batch.size(); mxsum += mx; issued += (long long) mx * (long long) batch.size();
+                    useful += sum;
+                    // MAYA_GLM_PREFILL_BATCH_STATS=2: also the members' own row counts, which is what
+                    // the tile-band split acts on (the aggregate max/sum cannot say how many members sit
+                    // either side of 256).
+                    static const bool bmem = getenv("MAYA_GLM_PREFILL_BATCH_STATS") != nullptr &&
+                                             std::atoi(getenv("MAYA_GLM_PREFILL_BATCH_STATS")) >= 2;
+                    if (bmem) {
+                        std::fprintf(stderr, "BSM dev%d layer %d nb=%zu rows", dev_, il, batch.size());
+                        for (const BItem& it : batch) std::fprintf(stderr, " %d", it.nrows);
+                        std::fprintf(stderr, "\n");
+                        std::fflush(stderr);
+                    }
+                    if (batch.size() < 4 || nb_ % 64 == 0)
+                        std::fprintf(stderr, "BSL dev%d layer %d batch %lld: nb=%zu max_rows=%d sum_rows=%d pad=%.1f%%"
+                                             " | cum nb=%lld experts=%lld issued=%lld useful=%lld pad=%.1f%% meanmax=%lld\n",
+                                     dev_, il, nb_, batch.size(), mx, sum,
+                                     100.0 * (double) (mx * (long long) batch.size() - sum) / (double) std::max(1, sum),
+                                     nb_, neu, issued, useful,
+                                     100.0 * (double) (issued - useful) / (double) std::max((long long) 1, useful),
+                                     nb_ ? mxsum / nb_ : 0);
+                        std::fflush(stderr);
+                }
+                BatchStage& b = batch_stage();
+                if (b.wgu == nullptr) {   // no staging: the single-expert product, unchanged
+                    for (const BItem& it : batch) run_blas_q_reuse(it.blob, it.a, it.nrows, r0, nullptr);
+                    batch.clear();
+                    return;
+                }
+                const size_t gu_elems = (size_t) 2 * nff * E, dn_elems = (size_t) E * nff;
+                const int nb = (int) batch.size();
+                // MAYA_GLM_PREFILL_RES_SPLIT=1 (R23 debug only): marks the sub-phases of the resident experts, so the
+                // profiler can say which one carries the time (the probe prices the same two GEMMs at 66 TFLOP/s
+                // while the engine's whole resident phase implies 16).  Unset: no event is recorded.
+                static const bool res_split = getenv("MAYA_GLM_PREFILL_RES_SPLIT") != nullptr;
+                const auto rmark = [&](const char* nm) {
+                    if (res_split) S->mark(nm, s);
+                };
+                // R27: the two matrices separated.  res_deq covers gate/up (IQ2_XXS) AND down (IQ2_S) a expert,
+                // but every standalone probe of this phase measured gate/up alone - that asymmetry is what made
+                // "the same kernel is 338 GB/s standalone and 146 in the engine" look like one number.
+                // MAYA_GLM_PREFILL_RES_SPLIT2=1 records an event after each matrix a expert (collect() sums
+                // deltas per name, so alternating names accumulate correctly).  Unset: no event is recorded.
+                static const bool res_split2 = getenv("MAYA_GLM_PREFILL_RES_SPLIT2") != nullptr;
+                // R27: the event BEFORE the first launch.  Between the previous batch's end and this batch's first
+                // to_f16 the host runs place()/the fit test/rows_f16 and the stream can drain - an event here makes
+                // that idle visible instead of billing it to the first dequant, which is what the gu mark did.
+                if (res_split2) S->mark("res_deq_pre", s);
+                // dequantize the batch's weights once (the only per-expert cost this path shares)
+                // R33: ONE launch a matrix for the whole batch, not one a expert a matrix.  The batch's
+                // destinations are contiguous (b.wgu + k*gu_elems) even though its sources are not, so the
+                // expert pointers travel by value (<= 32).  Measured on this card with the real IQ2_XXS body
+                // and a 1.5 GB non-resident source (research/r33/w1_launch.mu): 1 expert a launch 279.2 GB/s,
+                // 16 a launch 320.2 GB/s.  Falls back to the per-expert loop for any type/size it does not
+                // cover, so the arithmetic and the licence (DEQ_CHECK) are unchanged.
+                bool batched_deq = false;
+                if (nb >= 2) {
+                    const void* gu_src[32];
+                    const void* dn_src[32];
+                    for (int k = 0; k < nb; ++k) {
+                        gu_src[k] = batch[(size_t) k].blob;
+                        dn_src[k] = batch[(size_t) k].blob + Ly.down_off;
+                    }
+                    // ASK FIRST for BOTH matrices: this pack's down matrix is IQ2_S on most layers but a
+                    // third type on some, and issuing gu batched and then falling back re-does gu as well.
+                    batched_deq = mmq::to_f16_multi_ok(Ly.gu_type, (int64_t) gu_elems, nb) &&
+                                  mmq::to_f16_multi_ok(Ly.d_type, (int64_t) dn_elems, nb) &&
+                                  mmq::to_f16_multi(Ly.gu_type, gu_src, b.wgu, (int64_t) gu_elems, nb, s) &&
+                                  mmq::to_f16_multi(Ly.d_type, dn_src, b.wdn, (int64_t) dn_elems, nb, s);
+                }
+                if (!batched_deq) {
+                    for (int k = 0; k < nb; ++k) {
+                        mmq::to_f16(Ly.gu_type, batch[(size_t) k].blob, b.wgu + (size_t) k * gu_elems, (int64_t) gu_elems, s);
+                        mmq::to_f16(Ly.d_type, batch[(size_t) k].blob + Ly.down_off, b.wdn + (size_t) k * dn_elems,
+                                    (int64_t) dn_elems, s);
+                    }
+                }
+                rmark("res_deq");
+                const auto per_expert = [&] {
+                    for (int k = 0; k < nb; ++k) {
+                        const BlasBulk blk{b.wgu + (size_t) k * gu_elems, b.wdn + (size_t) k * dn_elems};
+                        run_blas_q_reuse(batch[(size_t) k].blob, batch[(size_t) k].a, batch[(size_t) k].nrows, r0, &blk);
+                    }
+                    rmark("res_perexp");
+                };
+                // R41: a ONE-expert batch runs the merged strided call too.  `nb < 2` sent every singleton to
+                // run_blas_q_reuse, and the census says singletons are 32317 of the resident experts' 165464,
+                // i.e. 48-67% of a card's merged calls are 1-wide.
+                // WHAT THIS DID **NOT** BUY, against my own prediction (measured, research/r41/prof_nb1.log vs
+                // research/r40/prof_on.log, four cards summed): I expected the merged nb=1 call to cost the
+                // microbench's 0.575 ms (gu 0.373 + dn 0.201, research/r41/price.mu) against the fallback's
+                // 0.733 ms, i.e. 22% off 23674 ms.  Instead the sub-phases simply MOVED: res_perexp
+                // 23674 -> 138 ms, res_gemm_gu 21658 -> 34506, res_gemm_dn 12156 -> 19501, x16/h16/copyout
+                // +3901.  Net resident +514 ms.  So the two paths cost the SAME per expert in the engine; the
+                // probe's nb=1 advantage is real in isolation but the merged body pays the gather, the 16-wide
+                // staging strides and the batch-wide kernels that run_blas_q_reuse folded into its own GEMMs.
+                // The retained gain is the small end-to-end one the A/B measures (1089.7 -> 1090.8/1090.9,
+                // research/r41/nb1_{off,on,on2,off2}.log), not a resident-phase saving.
+                // nb=1 is a legal strided-batched call (the stride is not read), so the arithmetic and the
+                // bit-exactness are untouched: both arms emit the same tokens.  MAYA_GLM_PREFILL_BATCH_NB1=0
+                // restores the fallback (the A/B control).
+                if (!batch_merged || (nb < 2 && !batch_nb1)) {
+                    per_expert();
+                    batch.clear();
+                    return;
+                }
+                // ---- ONE strided batched call over the batch, for the two products ----
+                // Which window rows the batch lands in, decided BEFORE any computation.  place() flushes whatever the
+                // window holds when the next run does not fit and continues it, so a batch that straddles a window
+                // boundary would have part of its rows added into ffn before the rest is written.  The condition
+                // below is exactly place()'s "never flush here": the batch continues the window and fits in it (or
+                // the window is empty and the batch fits the whole of it).  Anything else runs per expert, where
+                // each one places itself.
+                int max_rows = 0;
+                bool contiguous = true;
+                for (int k = 0; k < nb; ++k) {
+                    max_rows = std::max(max_rows, batch[(size_t) k].nrows);
+                    if (k > 0 && batch[(size_t) k].a != batch[(size_t) k - 1].a + batch[(size_t) k - 1].nrows)
+                        contiguous = false;
+                }
+                const int first_a = r0 + batch.front().a;
+                const int last_end = r0 + batch.back().a + batch.back().nrows;
+                const bool fits = w_hi == w_lo ? (last_end - first_a <= W)
+                                               : (w_hi == first_a && last_end - wb <= W);
+                if (!contiguous || !fits) {
+                    per_expert();
+                    batch.clear();
+                    return;
+                }
+                namespace x3 = strata::kernels::exl3;   // (the alias above lives inside run_blas_q_reuse)
+                std::vector<int> off((size_t) nb);
+                for (int k = 0; k < nb; ++k) off[(size_t) k] = place(r0 + batch[(size_t) k].a, batch[(size_t) k].nrows);
+                const size_t xstride = (size_t) max_rows * (size_t) E;             // b.x16 / b.y, one expert each
+                const size_t hstride = (size_t) max_rows * (size_t) nff;           // b.h16
+                const size_t gustride = (size_t) max_rows * (size_t) (2 * nff);    // b.gu
+                // R40: the batch's exact row bounds (prefix sums of its members' row counts), carried by value
+                // into the two batch-wide kernels above.  The members are contiguous in the sorted-row space
+                // (the `contiguous` test above passed), so the window row of member e, row r is
+                // off[0] + hb[e] + r -- which equals the off[e] + r that place() returned for it, since place()
+                // hands back a - wb and wb is the same for every member of a contiguous batch.
+                BatchRows brows{};
+                brows.nb = nb;
+                brows.maxr = max_rows;
+                for (int k = 0; k < nb; ++k) brows.hb[k + 1] = brows.hb[k] + batch[(size_t) k].nrows;
+                const bool one_d_a_batch = batch1d;
+                // (the gather keeps the per-expert form: research/r40/exact.mu verified the swiglu and the copyout
+                // bit-identical to their per-expert originals but could not settle the gather's own reference, so
+                // only the two verified kernels are merged.  It is 2 launches a batch either way.)
+                for (int k = 0; k < nb; ++k)
+                    rows_f16_portable(S->x, (int) E, M.row_tok + r0 + batch[(size_t) k].a, batch[(size_t) k].nrows,
+                                      (int) E, b.x16 + (size_t) k * xstride, s);
+                rmark("res_x16");
+                blas_ck(cublasGemmStridedBatchedEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) (2 * nff), max_rows, (int) E,
+                                                   &one, b.wgu, CUDA_R_16F, (int) E, (long long) gu_elems, b.x16,
+                                                   CUDA_R_16F, (int) E, (long long) xstride, &zero, b.gu, CUDA_R_32F,
+                                                   (int) (2 * nff), (long long) gustride, nb, CUBLAS_COMPUTE_32F,
+                                                   CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm batch gate/up (merged)");
+                rmark("res_gemm_gu");
+                if (one_d_a_batch)
+                    // R40: the swiglu AND the F32->F16 of its result in one launch over the batch's exact rows
+                    // (the per-expert form was two launches an expert; here it is one a batch, and the FP16
+                    // h16 is written directly instead of the F32 written and re-read)
+                    swiglu_rows_batch<<<dim3((unsigned) ((nff + 255) / 256),
+                                             (unsigned) ((size_t) nb * (size_t) max_rows)), 256, 0, s>>>(
+                        b.gu, b.h16, brows, (int) nff, g.swiglu_exp);
+                else {
+                    for (int k = 0; k < nb; ++k)   // the swiglu over each expert's own rows (its padded rows stay unused)
+                        gb::swiglu_rows(b.gu + (size_t) k * gustride, b.gu + (size_t) k * gustride,
+                                        batch[(size_t) k].nrows, (int) nff, g.swiglu_exp, s, (int) (2 * nff));
+                    rmark("res_swiglu");
+                    for (int k = 0; k < nb; ++k)
+                        rows_f16_portable(b.gu + (size_t) k * gustride, (int) (2 * nff), nullptr, batch[(size_t) k].nrows,
+                                          (int) nff, b.h16 + (size_t) k * hstride, s);
+                }
+                rmark("res_h16");   // (R40: on the merged path this closes swiglu+F16 together; res_swiglu reads 0)
+                blas_ck(cublasGemmStridedBatchedEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) E, max_rows, (int) nff, &one,
+                                                   b.wdn, CUDA_R_16F, (int) nff, (long long) dn_elems, b.h16,
+                                                   CUDA_R_16F, (int) nff, (long long) hstride, &zero, b.y, CUDA_R_32F,
+                                                   (int) E, (long long) xstride, nb, CUBLAS_COMPUTE_32F,
+                                                   CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm batch down (merged)");
+                rmark("res_gemm_dn");
+                if (one_d_a_batch)
+                    copyout_batch<<<dim3((unsigned) ((E + 255) / 256),
+                                         (unsigned) ((size_t) nb * (size_t) max_rows)), 256, 0, s>>>(
+                        b.y, M.OUTP, brows, off[0], (int) E);
+                else
+                    for (int k = 0; k < nb; ++k)   // the batch's valid rows into their OUTP window
+                        cudaMemcpyAsync(M.OUTP + (size_t) off[(size_t) k] * (size_t) E, b.y + (size_t) k * xstride,
+                                        (size_t) batch[(size_t) k].nrows * (size_t) E * sizeof(float),
+                                        cudaMemcpyDeviceToDevice, s);
+                rmark("res_copyout");
                 batch.clear();
             };
+            // R30: keep a merged call inside ONE tile band.  mublasGemmStridedBatchedEx costs
+            // ceil(M/256) tiles a call (research/r30/step.mu, 7 reps): at nb=16, M=256 is 1.840 ms and
+            // M=257 is 3.535 ms - the price doubles for ONE row over.  M is max_rows, so a single
+            // 257-512-row expert makes every member of its batch pay the second tile: 15 experts of
+            // 150 rows cost 3.535 ms instead of 1.840.  The scan is in ascending row order, so
+            // flushing on a band change keeps every batch inside a band without reordering the set -
+            // place() still sees ascending rows (reordering is what made R29's DEFER_BIG -8.7%).
+            // MAYA_GLM_PREFILL_TILE=<rows> sets the band (default 0 = off, today's behaviour).
             for (int i = 0; i < n_exp;) {
                 const int rows = hb[i + 1] - hb[i];
                 if (rows >= blas_rows && rows <= kRowCap) {
-                    static const int kBn = [] {
-                    const char* v = getenv("MAYA_GLM_PREFILL_BATCH_N");
-                    const int n = v != nullptr ? std::atoi(v) : 0;
-                    return n > 0 ? std::min(n, 32) : 0;
-                }();
-                const int cap = (kBn > 0 ? kBn : kB);
+                    const int cap = bn_alloc;   // (the staging buffers hold this many experts, see above)
                 if (!batch.empty() &&
                     (int) batch.size() >= cap) flush_batch();
+                    if (tile_rows > 0 && !batch.empty()) {
+                        int bmx = 0;
+                        for (const BItem& it : batch) bmx = std::max(bmx, it.nrows);
+                        if ((bmx - 1) / tile_rows != (rows - 1) / tile_rows) flush_batch();
+                    }
                     batch.push_back({wbase + (size_t) i * stride, hb[i], rows});
                     ++i;
                 } else if (rows > kRowCap) {   // too many rows for the padded staging: the single-expert product
                     flush_batch();
-                    run_blas_q(wbase + (size_t) i * stride, hb[i], rows, r0);
+                    run_blas_q_reuse(wbase + (size_t) i * stride, hb[i], rows, r0, nullptr);
                     ++i;
                 } else {
                     int j = i + 1;
