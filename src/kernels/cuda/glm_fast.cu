@@ -185,6 +185,17 @@ __device__ __forceinline__ int get_int_b2(const void* x, const int& i32) {
     return x32;
 }
 __device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { return ((const int*) x)[i32]; }
+// R3: get_int_b2's two 16-bit loads merged into one 32-bit load (same bytes, same value, little-endian).
+// These blocks only ever sit 2-byte aligned, so the compiler will not merge the pair itself, and on this part the
+// unmerged pair costs 11% of the kernel: the isolated IQ3_S gate/up at the engine's own geometry reads 90.1 GB/s
+// with get_int_b2 against 99.9 with a 32-bit word (/tmp/guload.mu).  GGML's little-endian block layout makes
+//     x16[2i] | x16[2i+1] << 16   ==   the 32-bit word at byte 4i
+// so this is the same integer by construction; validated against get_int_b2 over the engine's own shapes.
+__device__ __forceinline__ int get_int_b2_merged(const void* x, const int& i32) {
+    int v;
+    __builtin_memcpy(&v, (const uint8_t*) x + 4 * (size_t) i32, 4);
+    return v;
+}
 __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
@@ -1028,10 +1039,23 @@ template<> __device__ __forceinline__ float dw<22>(const uint8_t* row, int kbx, 
 }
 template<> __device__ __forceinline__ float dw<21>(const uint8_t* row, int kbx, int iqs, const XV& x, const uint32_t* tab) {
     const block_iq3_s* bq3 = (const block_iq3_s*) row + kbx;
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
+    // R3: one 32-bit word a half instead of get_int_b2's two 16-bit loads (get_int_b2_merged).  These blocks
+    // are only 2-byte aligned, so the compiler never merges the pair; on this part the unmerged pair costs
+    // 11% of the kernel: the isolated IQ3_S gate/up at the engine's own geometry reads 90.1 GB/s through
+    // get_int_b2 against 99.9 through one 32-bit word (/tmp/guload.mu, 32 warps x 1 row a warp, grid (64,8)).
+    // Same integer, not an approximation: GGML's little-endian block layout makes
+    //     x16[2i] | x16[2i+1] << 16   ==   the 32-bit word at byte 4i.
+    const int2 qs_packed = make_int2(get_int_b2_merged(bq3->qs, iqs + 0), get_int_b2_merged(bq3->qs, iqs + 1));
+    const uint8_t* qs = (const uint8_t*) &qs_packed;
+    const int qh = bq3->qh[iqs / 2];
+    const int signs_packed_32 = get_int_b2_merged(bq3->signs, iqs / 2);
+#else
     const int2 qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
     const uint8_t* qs = (const uint8_t*) &qs_packed;
     const int qh = bq3->qh[iqs / 2];
     const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
+#endif
     const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
     int sumi = 0;
 #pragma unroll
@@ -7407,6 +7431,17 @@ void note_gu22(bool tuned, int path) {
     std::fprintf(stderr, "glm experts: CUDA%d IQ2_S gate/up on the %s kernel (%s)\n", dev, tuned ? "tuned RDNA" : "original",
                  path ? "multi-token launch" : "token path");
 }
+// R3: the routed gate/up launch's block width for IQ3_S (type 21).  NW=32 (the shipped value) is 1024 threads a
+// block, which on this part is one block a SM (regsPerBlock 131072); NW=16 is 512, two a SM.  The block's rows all
+// wait on one 8-byte device read (d.plan_ptr[ei]) before any address exists, so the second resident block is what
+// hides it.  Same 32 rows a block, same dot order - the sums are bit-identical either way.
+bool gu_nw16() {
+    static const bool on = [] {
+        const char* v = std::getenv("MAYA_GLM_GU_NW");
+        return v != nullptr && std::atoi(v) == 16;
+    }();
+    return on;
+}
 // Splitting shared down removes its dynamic type switch from routed gate/up's
 // register budget. The routed grid keeps exactly the original dot/reduction order.
 __global__ void __launch_bounds__(256) rdna_shared_down_kernel(const uint8_t* weights, int type,
@@ -7491,8 +7526,18 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
                     xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
         } else if (gu_type == 21) {
             // the sign table's LUT arm is the shipped one (DIRECT = false in the 6th slot is LUT = true, DIRECT = true)
-            launch_expert_gu<21, 32, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
-                xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+            // R3: NW also sets RPW = GU_ROWS / NW.  At NW=32 the block is 1024 threads, and this part allows one
+            // block a SM (regsPerBlock 131072), so the block's opening dependency - d.plan_ptr[ei], an 8-byte read
+            // that every weight address waits on - has no other block to hide behind.  NW=16 is 512 threads: two
+            // blocks a SM, same 32 rows and the same dot order, so the sums are identical (the row split is still
+            // chunk * GU_ROWS).  MAYA_GLM_GU_NW=16 for the A/B.
+            if (gu_nw16()) {
+                launch_expert_gu<21, 16, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
+                    xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+            } else {
+                launch_expert_gu<21, 32, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
+                    xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+            }
         } else {
             launch_expert_gu<23, 32, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
                 xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
