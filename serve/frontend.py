@@ -558,12 +558,81 @@ def unmark_literals(prompt: str, tags: dict[str, str]) -> tuple[str, list[tuple[
     return "".join(out), spans
 
 
-def _late_system_to_user(messages: list[dict]) -> list[dict]:
-    """The chat template takes a system message only at the start ("System message must be at the beginning").
-    Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user
-    turn, some OpenAI clients a late "developer" message (issue #56) - so those become user messages, in place:
-    merging them into the first one would change the prompt's start and cost the conversation cache every turn."""
-    return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
+_REMINDER_RE = re.compile(r"^\s*<system-reminder>(.*?)</system-reminder>\s*$", re.DOTALL | re.IGNORECASE)
+_REMINDER_ONLY_RE = re.compile(r"^\s*<system-reminder>", re.IGNORECASE)
+
+
+def _strip_reminder(content: str) -> str:
+    """A `<system-reminder>` block's text without its tags: the markers are the harness's way of telling ITSELF which
+    turns are context, and mean nothing to the model - left in a system message they read as "somebody else's
+    reminder pasted into my instructions"."""
+    m = _REMINDER_RE.match(content)
+    if m:
+        return m.group(1).strip()
+    if _REMINDER_ONLY_RE.match(content):
+        return _REMINDER_ONLY_RE.sub("", content).replace("</system-reminder>", "").strip()
+    return content
+
+
+def _coalesce_system(messages: list[dict]) -> list[dict]:
+    """The prompt a strict chat template can take, as vLLM makes it: ONE leading system message, then the turns.
+
+    Two things this fixes, both measured here against DeepSeek Harness (whose AGENTS.md, runtime context and skill
+    catalog arrive as extra turns after the real question):
+
+    1. Several system turns.  vLLM's OpenAI frontend concatenates them into the first with a blank line; its
+       Anthropic frontend hoists inline ones (vLLM #58727 is this very model, `vllm serve zai-org/GLM-5.3-Flash`
+       behind Claude Code).  Maya used to demote a late one to a user turn in place (`_late_system_to_user`) - the
+       model then read 11 KB of instructions as text the user had pasted into the conversation, called it "a prompt
+       injection attempt", and answered nothing.
+
+    2. Two user turns in a row.  DSH sends the question, then its context turns; once the system turns are gone the
+       template renders `<|user|>question<|user|>context<|assistant|>`, which GLM reads as one long message.  The
+       extra user turns are folded into the question with a blank line, the way vLLM folds system turns.
+
+    Only turns that are *entirely* a `<system-reminder>` block move: a user turn with real text around one keeps its
+    place, and is not part of the conversation's instruction set.
+
+    The cost is the prompt's start moving when such a turn appears, which drops the conversation cache once - the
+    alternative is the model refusing the request."""
+    if not messages:
+        return messages
+    sys_parts, rest, moved = [], [], False
+    for i, m in enumerate(messages):
+        role = m.get("role")
+        content = m.get("content")
+        if role == "system":
+            sys_parts.append(_strip_reminder(content) if isinstance(content, str) else "")
+            if i > 0:
+                moved = True
+            continue
+        if role == "user" and isinstance(content, str):
+            if _REMINDER_ONLY_RE.match(content):
+                sys_parts.append(_strip_reminder(content))
+                moved = True
+                continue
+        rest.append(m)
+    if not sys_parts and not moved:
+        return messages
+    head = "\n\n".join(t for t in sys_parts if t)
+
+    # two user turns in a row: fold them (the template has no separator of its own)
+    folded, prev_user = [], False
+    for m in rest:
+        is_user = m.get("role") == "user"
+        if is_user and prev_user and folded:
+            prev = dict(folded[-1])
+            prev["content"] = (str(prev.get("content") or "") + "\n\n" + str(m.get("content"))).strip()
+            folded[-1] = prev
+            moved = True
+            continue
+        folded.append(m)
+        prev_user = is_user
+
+    if not moved and len(sys_parts) <= 1:
+        return messages
+    out = ([{"role": "system", "content": head}] if head else []) + folded
+    return out
 
 
 _TOOL_ORDERS: "OrderedDict[frozenset, tuple]" = OrderedDict()   # a set of tool names -> the order it first came in
@@ -721,7 +790,7 @@ def openai_to_messages(req: dict, deepseek: bool = False,
         kwargs["_force_tool"] = ""
     elif tools and isinstance(tc, dict) and tc.get("type") == "function" and (tc.get("function") or {}).get("name"):
         kwargs["_force_tool"] = tc["function"]["name"]
-    return _late_system_to_user(_json_format_note(req, messages)), tools, kwargs
+    return _coalesce_system(_json_format_note(req, messages)), tools, kwargs
 
 
 def anthropic_to_messages(req: dict, deepseek: bool = False,
@@ -794,7 +863,7 @@ def anthropic_to_messages(req: dict, deepseek: bool = False,
         kwargs["_force_tool"] = ""
     elif tools and tc.get("type") == "tool" and tc.get("name"):
         kwargs["_force_tool"] = tc["name"]
-    return messages if deepseek else _late_system_to_user(messages), tools, kwargs
+    return messages if deepseek else _coalesce_system(messages), tools, kwargs
 
 
 # ------------------------------------------------------------------------------------------------ output parser
