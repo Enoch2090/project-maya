@@ -100,6 +100,17 @@ void stage_ledger_flush(int device, cudaStream_t s, const char* name);
 void stage_ledger_discard();
 /// The token's per-stage sums into the device's totals (keep false: the token's first n are left out, as the prof)
 void stage_ledger_commit(int device, cudaStream_t s, bool keep);
+/// The WINDOW path's ledger (R78): a part-thread's closed window stages into this device's totals.  The pipelined
+/// decode enqueues the verify window on crew threads and never calls collect() there, so without this its bytes -
+/// the bulk of what decode reads - are recorded and then dropped.  Bytes only: a window stage's ms is not paired
+/// with them here (see glm_window.cu's report and the DFLASH profiler for the time).
+void stage_ledger_wcommit(int device, int ntokens = 1);
+/// The device's window-path totals: cb once a (stage, type, columns) triple.
+void stage_ledger_wget(int device,
+                       void (*cb)(void* ctx, const char* stage, int type, int ncol, uint64_t jobs, double bytes,
+                                  uint64_t passes, int64_t n_in, int64_t n_out),
+                       void* ctx, uint64_t* tokens);
+
 /// The device's totals: cb once a (stage, type, columns) triple.
 void stage_ledger_get(int device,
                       void (*cb)(void* ctx, const char* stage, int type, int ncol, uint64_t jobs, double bytes,

@@ -190,6 +190,23 @@ __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t s = v ^ p << 7;
     return s * 0x01010101;
 }
+// R3: the same 16-entry codebook gather with the table as IMMEDIATE words instead of four loads.
+// get_int_from_table_16 does 8 __byte_perm a call; this does 2 and touches no memory.  glmd_mv_dots.cuh's
+// iq4nl_pack is the same expression, so the arithmetic is bit-identical and only the instruction count changes.
+// IQ4_XS is 34 of Maya-L's 42 expert layers' down matrix, and the R63 ledger reads 20.4 GB/s for it against
+// 118 GB/s for Q5_K's dot_q5_K (no table lookup) at bytes within 3.5% (427.8 vs 443.7 MB).
+__device__ __forceinline__ int iq4nl_lut(int v, int shift) {
+    const uint32_t q = ((uint32_t) v >> shift) & 0x0F0F0F0Fu;
+    const uint32_t sel = (q & 0xFu) | ((q >> 4) & 0xF0u) | ((q >> 8) & 0xF00u) | ((q >> 12) & 0xF000u);
+    const uint32_t lo = __byte_perm(0xBFAD9881u, 0xF6EADDCFu, sel);
+    const uint32_t hi = __byte_perm(0x26190D01u, 0x71594535u, sel);
+    const uint32_t msk = ((q >> 3) & 0x01010101u) * 0xFFu;
+    return (int) ((lo & ~msk) | (hi & msk));
+}
+__device__ __forceinline__ int2 iq4nl_16(const int& q4) {
+    return make_int2(iq4nl_lut(q4, 0), iq4nl_lut(q4, 4));
+}
+
 __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
     const uint32_t* table32 = (const uint32_t*) table;
     uint32_t tmp[2];
@@ -610,7 +627,7 @@ __device__ __forceinline__ float dot_iq4_xs(const void* vbq, const block_q8_1* b
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
-        const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+        const int2 v = iq4nl_16(aux_q4);
         const int u0 = get_int_b4(bq8_1[iqs / 4].qs, j + 0);
         const int u1 = get_int_b4(bq8_1[iqs / 4].qs, j + 4);
         sumi = __dp4a(v.x, u0, sumi);
@@ -900,7 +917,7 @@ template<> __device__ __forceinline__ float dw<23>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
-        const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+        const int2 v = iq4nl_16(aux_q4);
         sumi = __dp4a(v.x, x.u[j + 0], sumi);
         sumi = __dp4a(v.y, x.u[j + 4], sumi);
     }
@@ -1257,6 +1274,12 @@ template<> __device__ __forceinline__ float dw_rdna<17>(const uint8_t* row, int 
 template<> __device__ __forceinline__ float dw_rdna<21>(const uint8_t* row, int kbx, int iqs,
     const XV& x, const uint32_t* tab, const uint4*, bool, bool) {
     return dw<21>(row, kbx, iqs, x, tab);
+}
+// IQ4_XS: no codebook and no sign table (its 4-bit codes are their own values through kvalues_iq4nl), so the
+// tuned and the original dot are the same expression - the win is the launch geometry, not the dot.
+template<> __device__ __forceinline__ float dw_rdna<23>(const uint8_t* row, int kbx, int iqs,
+    const XV& x, const uint32_t* tab, const uint4*, bool, bool) {
+    return dw<23>(row, kbx, iqs, x, tab);
 }
 template<int T, int NR>
 __device__ __forceinline__ void rows_dot_rdna(const uint8_t* const* rows, const block_q8_1* x,
@@ -4009,11 +4032,16 @@ struct RouteArgs {
     float miss_skip_w;          // MAYA_GLM_MISS_SKIP_W (prototype): experts not in VRAM whose share of the route's
                                 // weights is below this are left out like skip_from's, at any rank (0: none)
     int win_rows;               // win / win_n are a batched rows step's row and rows (MAYA_GLM_GROUP_EXPERTS)
+    int selfx = 1;              // MAYA_GLM_ROUTE_SELFX: the normalisation's fmax as a compare-select (the same double);
+                                // the launcher's positional initialiser stops at win_rows, this one is set beside it
     float affinity;             // MAYA_GLM_ROUTE_AFFINITY: added to a VRAM-resident expert's selection score (its
                                 // weight stays its own probability) - LOSSY, it changes which experts run (0: off)
     int rank_sel;               // the selections by topk_rank (MAYA_GLM_ROUTE_RANK; the host checks E fits it)
     unsigned long long* prof;   // MAYA_GLM_ROUTE_PROF (measurement): block 0's cycles from its start to each phase's
                                 // end, summed over routes (host-mapped; [15] counts the routes); null: off
+    int xw = 2;                 // MAYA_GLM_ROUTE_XW (R69): 1 = write x on every route (the old behaviour),
+                                // 2 = only when the host can answer one (cpu_plan or a helper), 0 = never
+    int host_may_answer;        // (R69) cpu_plan != 0 or a helper is attached: the only ways rq->cpu_mask gets a bit
     int fast;                   // MAYA_GLM_ROUTE_FAST (on by default; =0: the old order, A/B): the error flag from
                                 // its device copy, the request's x out at the start, the plan's reads in parallel
                                 // into shared memory, the request head a thread a field - the same plan and request
@@ -4060,7 +4088,10 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
                                                    : (a.d.route_error != nullptr && *a.d.route_error != 0 ? 1 : 0);
     // ROUTE_FAST: the FFN input out to the request's slot now (this route's slot: seq is this kernel's to advance),
     // its PCIe writes beside the selection instead of after the plan - whether or not the CPU lane takes an expert
-    if (a.fast) {
+    // the FFN input to the request's slot: only the host's CPU lane and its helper ever read it back (rq->x, under
+    // "rq->cpu_mask != 0"), and cpu_mask is non-zero only when cpu_plan is on or a helper is attached - so with
+    // neither, this 16 KB PCIe write is dead traffic (the slow path below already gates the same write that way)
+    if (a.fast && a.xw != 0 && (a.xw == 1 || a.host_may_answer != 0)) {
         MoeRequest* rq0 = ring_entry(a.d.ring, *a.d.seq + 1, a.d.ring_n, a.d.ring_stride);
         for (int e = tid; e < a.n_embd; e += ROUTE_THREADS) rq0->x[e] = a.x[e];
     }
@@ -4243,11 +4274,14 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     // to_cpu times, are the experts whose rank in that order is below to_cpu: a lane an expert, its rank by shuffles
     float inv_w = 1.0f;
     unsigned int host_w = 0;
+    long long r68_w0 = 0;   // R68_PROF: warp 0's sum ends here (prof[13]); thread 0's plan begins at prof[14]
     if (a.fast && tid < 32) {
         const float pv = tid < a.k ? s_p[s_ids[tid]] : 0.0f;
         double sum = 0.0;
         for (int i = 0; i < a.k; ++i) sum += (double) __shfl_sync(0xffffffffu, pv, i);
-        inv_w = (float) (!a.norm_w ? 1.0 : kExt && a.norm_mode == kRouteNormHf ? 1.0 / (sum + 1e-20) : 1.0 / fmax(sum, 6.103515625e-5))   /* glm-dsa B5.1 */;
+        inv_w = (float) (!a.norm_w ? 1.0
+                        : kExt && a.norm_mode == kRouteNormHf ? 1.0 / (sum + 1e-20)
+                        : 1.0 / (a.selfx ? (sum > 6.103515625e-5 ? sum : 6.103515625e-5) : fmax(sum, 6.103515625e-5)))   /* glm-dsa B5.1 */;
         if (lane_plan) {
             const float msw = skipped ? 0.0f : a.miss_skip_w;
             const bool light = msw > 0.0f && (float) ((double) pv * inv_w) < msw;
@@ -4264,15 +4298,22 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
             }
             host_w = __ballot_sync(0xffffffffu, ram && rank < to_cpu);
         }
+        if (tid == 0) r68_w0 = clock64();   // (R68_PROF: prod[13])
     }
     if (tid == 0) {
-        const long long pt0 = clock64();   // (ROUTE_PROF: the plan's own phases, prof[9..13])
+        const long long pt0 = clock64();   // (ROUTE_PROF: the plan's own phases, prof[9..12])
+        if (a.prof != nullptr) {           // (R68_PROF: prof[14], this plan's start, from the kernel's start)
+            atomicAdd(a.prof + 13, (unsigned long long) (r68_w0 ? r68_w0 - rp_t0 : 0));
+            atomicAdd(a.prof + 14, (unsigned long long) (pt0 - rp_t0));
+        }
         long long pt[4] = {pt0, pt0, pt0, pt0};
         float inv = inv_w;
         if (!a.fast) {
             double sum = 0.0;
             for (int i = 0; i < a.k; ++i) sum += (double) s_p[s_ids[i]];
-            inv = (float) (!a.norm_w ? 1.0 : kExt && a.norm_mode == kRouteNormHf ? 1.0 / (sum + 1e-20) : 1.0 / fmax(sum, 6.103515625e-5))   /* glm-dsa B5.1 */;
+            inv = (float) (!a.norm_w ? 1.0
+                          : kExt && a.norm_mode == kRouteNormHf ? 1.0 / (sum + 1e-20)
+                          : 1.0 / (a.selfx ? (sum > 6.103515625e-5 ? sum : 6.103515625e-5) : fmax(sum, 6.103515625e-5)))   /* glm-dsa B5.1 */;
         }
         unsigned int mask = 0, fetch = 0, promo = 0, cpu = 0, skip = 0;
         // RESIDENT_SKIP_W / _TOPK: the experts the token goes without, wherever they live (not for a token past a wrong
@@ -5601,6 +5642,18 @@ struct LedgerTotal {
 };
 std::mutex g_led_mu;
 std::map<int, LedgerTotal> g_led;   // device -> totals
+// MAYA_GLM_R63_STAGE, the WINDOW path's own account (R78): decode's verify window enqueues its layers on the crew
+// threads (glm_window.cu's win_pipe_part), and a thread's t_tok is only ever committed by that thread's own
+// collect() - which the pipelined decode never calls (it runs win_pipe_begin/push/pick/settle, not window()'s
+// collect()).  So every window stage's bytes were recorded and then dropped, and the device table above only ever
+// described the token path's single-column passes.  This second ledger is per DEVICE and takes a part-thread's
+// closed stages as they are enqueued: bytes need no stream sync, so the pipeline is untouched (the ms of these
+// stages is read by the DFLASH profiler's own phases instead, never paired with these bytes here).
+struct WindowLedger {
+    std::map<std::string, LedgerMap> stage;   // stage -> (type, ncol) -> jobs, bytes
+    uint64_t tokens = 0;                      // window tokens this device enqueued
+};
+std::map<int, WindowLedger> g_wled;           // device -> totals (guarded by g_led_mu)
 }  // namespace
 
 bool stage_ledger_on() {
@@ -5720,6 +5773,60 @@ void stage_ledger_get(int device,
         for (const auto& e : st.second)
             cb(ctx, st.first.c_str(), e.first.type, e.first.ncol, e.second.jobs, e.second.bytes, e.second.passes,
                e.second.n_in, e.second.n_out, it->second.ms.count(st.first) ? it->second.ms.at(st.first) : 0.0);
+}
+
+void stage_ledger_wcommit(int device, int ntokens) {
+    if (!stage_ledger_on()) return;
+    std::lock_guard<std::mutex> lk(g_led_mu);
+    WindowLedger& W = g_wled[device];
+    auto it = t_tok.find(device);
+    if (it != t_tok.end()) {
+        for (const auto& kv : it->second)
+            for (const auto& e : kv.second) {
+                LedgerVal& v = W.stage[kv.first][e.first];
+                v.jobs += e.second.jobs;
+                v.bytes += e.second.bytes;
+                v.passes += e.second.passes;
+                v.n_in = e.second.n_in;
+                v.n_out = e.second.n_out;
+            }
+        t_tok.erase(it);
+    }
+    if (t_cur.count(device) && !t_cur[device].empty()) {
+        // the launches after the last mark of this token: given their own row, nothing is silently dropped
+        auto& cur = t_cur[device];
+        LedgerMap& dst = W.stage["win:unmarked"];
+        for (const auto& kv : cur) {
+            LedgerVal& d = dst[kv.first];
+            d.jobs += kv.second.jobs;
+            d.bytes += kv.second.bytes;
+            d.passes += 1;
+            d.n_in = kv.second.n_in;
+            d.n_out = kv.second.n_out;
+        }
+        t_cur.erase(device);
+    }
+    t_ev[device].n = 0;   // (no interval of a window stage is paired with these bytes: see the note above)
+    t_time[device].clear();
+    W.tokens += (uint64_t) std::max(1, ntokens);
+}
+
+void stage_ledger_wget(int device,
+                       void (*cb)(void* ctx, const char* stage, int type, int ncol, uint64_t jobs, double bytes,
+                                  uint64_t passes, int64_t n_in, int64_t n_out),
+                       void* ctx, uint64_t* tokens) {
+    if (!stage_ledger_on()) return;
+    std::lock_guard<std::mutex> lk(g_led_mu);
+    auto it = g_wled.find(device);
+    if (it == g_wled.end()) {
+        if (tokens != nullptr) *tokens = 0;
+        return;
+    }
+    if (tokens != nullptr) *tokens = it->second.tokens;
+    for (const auto& st : it->second.stage)
+        for (const auto& e : st.second)
+            cb(ctx, st.first.c_str(), e.first.type, e.first.ncol, e.second.jobs, e.second.bytes, e.second.passes,
+               e.second.n_in, e.second.n_out);
 }
 
 namespace {
@@ -6389,7 +6496,19 @@ void embed_streams(const float* emb, float* R, int n_embd, cudaStream_t s) {
     launch_check("embed_streams");
 }
 
+// MAYA_GLM_R67_DEAD=<bitmask> (measurement, one run): 1 kda_prep, 2 kda_rec, 4 moe_route - the launcher returns
+// before launching anything, so the stage profiler's interval holds whatever is left with the kernel's work gone.
+// The numbers it produces are wrong; only the intervals mean anything.
+static int r67_dead() {
+    static const int v = [] {
+        const char* e = getenv("MAYA_GLM_R67_DEAD");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    return v;
+}
+
 void kda_prep(const KdaPrepArgs& a, cudaStream_t s) {
+    if (r67_dead() & 1) { launch_check("kda_prep"); return; }
     kda_prep_kernel<<<dim3(a.n_head, 11), 128, 0, s>>>(a);   // 3 conv roles + 2 x 4 gate quarters
     launch_check("kda_prep");
 }
@@ -6402,6 +6521,7 @@ void kda_rec(const float* q, const float* k, const float* v, const float* g1, co
         g_launch_errors.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    if (r67_dead() & 2) { launch_check("kda_rec"); return; }
     kda_rec_kernel<<<n_head, 256, 0, s>>>(q, k, v, g1, beta_raw, state, g2, norm_w, eps, n_head,
                                           (block_q8_1*) out_q8_1);
     launch_check("kda_rec");
@@ -6997,7 +7117,20 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
         const char* v = getenv("MAYA_GLM_ROUTE_FAST");
         return v == nullptr || std::atoi(v) != 0 ? 1 : 0;
     }();
+    // MAYA_GLM_ROUTE_SELFX=0: the normalisation's fmax back as it was (A/B).  fmax on DOUBLES measured 110 ticks
+    // of a route here (R68: 237 -> 127 for the whole divide region); a compare-select takes the same double, so
+    // 1.0/x is the same bit for bit - this is a cheaper way to write the same value, not a different value.
+    static const bool selfx = [] {
+        const char* v = getenv("MAYA_GLM_ROUTE_SELFX");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
     a.fast = route_fast && k <= 8 ? 1 : 0;
+    a.selfx = selfx ? 1 : 0;
+    {   // R69: the x write, only where the host can read it back (=1 restores the old unconditional write)
+        const char* xw = getenv("MAYA_GLM_ROUTE_XW");
+        a.xw = xw != nullptr ? std::atoi(xw) : 2;
+        a.host_may_answer = (cpu_plan != 0ull || d.helper_owned != nullptr) ? 1 : 0;
+    }
     // MAYA_GLM_ROUTE_PROF=1 (measurement): the route kernel's phases in cycles, averaged and printed at exit
     static unsigned long long* prof_h = [] {
         unsigned long long* p = nullptr;
@@ -7017,6 +7150,15 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
             std::fprintf(stderr, "\nglm route prof: thread 0's plan, cycles a phase:");
             for (int i = 0; i < 4; ++i) std::fprintf(stderr, " | %s %.0f", sub[i], (double) prof_h[9 + i] / (double) n);
             std::fprintf(stderr, "\n");
+            // R68_PROF: the same window split by who did it - warp 0, thread 0, then the barrier and the
+            // profiler's own host-mapped atomics (which are inside the window and are not kernel work)
+            const double w0 = (double) prof_h[13] / (double) n;   // (prof_h[14] is stamped too; the difference is the line above)
+            const double t0plan = (double) (prof_h[9] + prof_h[10] + prof_h[11] + prof_h[12]) / (double) n;
+            const double planwin = (double) prof_h[4] / (double) n - (double) prof_h[3] / (double) n;
+            std::fprintf(stderr, "glm route prof: the plan window split (counts -> plan): warp0sum %.0f | "
+                                 "thread0 plan %.0f | barrier + marks %.0f | window %.0f\n",
+                         w0 - (double) prof_h[3] / (double) n, t0plan, planwin - (w0 - (double) prof_h[3] / (double) n) - t0plan,
+                         planwin);
         });
         return p;
     }();
@@ -7031,6 +7173,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
     }
     const int blocks = 1 + (n_ff_sh + ROUTE_THREADS - 1) / ROUTE_THREADS;
     // the glm-dsa instance only for what needs it (the HF normalisation, a bench seed); Maya's route: v1.1.56's kernel
+    if (r67_dead() & 4) { launch_check("moe_route"); return; }
     if (a.norm_mode != kRouteNormClamp || a.rand_seed != 0ull) moe_route_kernel<true><<<blocks, ROUTE_THREADS, 0, s>>>(a);
     else moe_route_kernel<false><<<blocks, ROUTE_THREADS, 0, s>>>(a);
     launch_check("moe_route");
@@ -7188,6 +7331,40 @@ bool gu22_tuned() {
     }();
     return on;
 }
+// R1: the routed experts' DOWN launch for the K-quant / IQ4_XS expert types.  On the shipped path only type 16
+// (IQ2_XXS) and 22 (IQ2_S) reach the tuned kernel; every other type - which is every expert of Maya-L (34 of 42
+// layers are IQ4_XS down, 8 are Q5_K) - falls through to moe_down_kernel with DOWN_ROWS = 4: four output rows a
+// block, one activation load per call for all four, and 1024 blocks.  The bytes are the same; the block count is
+// what differs, and on this part the narrow grid is what leaves the memory pipe idle (the ledger reads 20.3 GB/s
+// for moe_down type 23 against 215 GB/s for a dense Q6_K GEMV on the same card).  MAYA_GLM_DN_ROWS sets the rows a
+// block (1, 2, 4; unset = 1, the measured best; 4 = the path this shipped with).  Each row's dot is the same dw<T>
+// calls in the same order with the same activation blocks, so the sums are bit-identical whatever the row count.
+int dn_rows() {
+    static const int r = [] {
+        const char* v = std::getenv("MAYA_GLM_DN_ROWS");
+        const int n = v != nullptr ? std::atoi(v) : 1;   // R1: 1 row a block measured fastest (was 4)
+        return (n == 1 || n == 2 || n == 4) ? n : 1;
+    }();
+    return r;
+}
+// R74: the half of R73's C2 lever that lives in the gate/up dispatch - the packed sign expansion fetched from the
+// 128-entry shared-memory table the kernel already knows how to fill (load_signs<TG>, the LUT && !DIRECT branch)
+// instead of recomputed by direct_signs per k0.  R73 measured 1.183x at the engine's own geometry, 0/16384
+// elementwise difference; this switch is what lets that be re-measured on the real engine, because the production
+// launch's 6th template argument is DIRECT=true and flipping it also turns on the LUT-side branch's LDS fill.
+// MAYA_GLM_GU_SIGNS: 0 = DIRECT=true for both types (the shipped path, A/B); unset or 1 = the LDS table for IQ2_XXS
+// (T=16) only, which is the arm R74 measured end to end; 2 = the LDS table for IQ2_S (T=22) too, which is compiled
+// but was NOT measured this round - that type only reaches the tuned path under MAYA_GLM_GU22_TUNED=1, so it keeps
+// the shipped DIRECT setting by default rather than shipping an unmeasured kernel.
+int gu_signs_lds(int type) {
+    static const int mode = [] {
+        const char* v = std::getenv("MAYA_GLM_GU_SIGNS");
+        return v != nullptr ? std::atoi(v) : 1;
+    }();
+    if (mode == 0) return 0;
+    if (mode >= 2) return 1;
+    return type == 16 ? 1 : 0;
+}
 // Which kernel IQ2_S gate/up ran, once per device and call path (0 the token path, 1 the window's multi-token launch):
 // the engine's own record that MAYA_GLM_GU22_TUNED reached the dispatch - or did not
 void note_gu22(bool tuned, int path) {
@@ -7242,7 +7419,15 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     stage_ledger_note(gu_type, 1, n_embd, 2 * n_ff, (uint64_t) std::max(0, k));
     if (sh_down != nullptr && sh_out != nullptr) stage_ledger_note(sh_type, 1, n_ff_sh, n_embd, 1);
 #if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
-    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true, gu_type == 22 && gu22_tuned());
+    // R1: types 21 (IQ3_S) and 23 (IQ4_XS) join the tuned dispatch.  Every piece the tuned kernel needs is already
+    // there for 21 - TabWords<21> (the iq3s_grid codebook in shared memory, 512 words), dw_rdna<21> (which is dw<21>,
+    // the same dot), sign_count<21> = 128 (the sign-byte table) - and for 23 as well (no codebook, no sign table:
+    // its 4-bit codes go through kvalues_iq4nl by __byte_perm).  The gate admitted only the two IQ2 types, so on
+    // Maya-L's IQ3_S experts the 32-lane in-flight-load geometry never ran: the ledger reads 59.8 GB/s on
+    // moe_gate_up type 21 against 215 GB/s for a dense Q6_K GEMV on the same card.  MAYA_HIP_EXPERTS_LEGACY=1 still
+    // takes the old dispatch (rdna3_expert_device reads it) for an A/B.
+    const bool gu_tuned_type = gu_type == 16 || (gu_type == 22 && gu22_tuned()) || gu_type == 21 || gu_type == 23;
+    const bool tuned = gu_tuned_type && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true, gu_type == 22 && gu22_tuned());
     if (gu_type == 22) note_gu22(tuned, 0);
     if (tuned) {
         // Packed sign expansion, original 16-wave/four-row geometry, grid in LDS; WIDE reads a super-block's
@@ -7258,12 +7443,29 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
         // 65536 and warpSize 32, but this part reports 131072 and 128 (research/r18/occ.mu), and the production
         // instance is Temp=51, so two 1024-thread blocks already fit a CU.  The 1.06x is real; the occupancy
         // story behind it is not.)
-        if (gu_type == 16)
-            launch_expert_gu<16, 32, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
+        // R74: the signs arm from an LDS table (gu_signs_lds()), the DIRECT one is the shipped path
+        if (gu_type == 16) {
+            if (gu_signs_lds(16))
+                launch_expert_gu<16, 32, false, true, true, false, true>(d, k, n_embd, n_ff, limit,
+                    xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+            else
+                launch_expert_gu<16, 32, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
+                    xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+        } else if (gu_type == 22) {
+            if (gu_signs_lds(22))
+                launch_expert_gu<22, 32, false, true, true, false, true>(d, k, n_embd, n_ff, limit,
+                    xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+            else
+                launch_expert_gu<22, 32, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
+                    xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+        } else if (gu_type == 21) {
+            // the sign table's LUT arm is the shipped one (DIRECT = false in the 6th slot is LUT = true, DIRECT = true)
+            launch_expert_gu<21, 32, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
                 xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
-        else
-            launch_expert_gu<22, 32, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
+        } else {
+            launch_expert_gu<23, 32, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
                 xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+        }
         launch_check("moe_gate_up RDNA3");
         return;
     }
@@ -7392,6 +7594,33 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
         return;
     }
 #endif
+    const int rows = dn_rows();
+    if (rows == 1 || rows == 2) {
+        // R1: the same kernel at 1 or 2 rows a block - the narrow grid the tuned types 16/22 already use.
+        // Each row's sum is the same dw<T> calls over the same activation blocks, so the output is bit-identical.
+        const auto* H2 = (const block_q8_1*) hq;
+        const int blocks = n_embd / rows;
+        bool done = true;
+#define GLMF_DN_R(T, R) \
+        case T: moe_down_kernel<T, R><<<blocks, 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H2, sh_out, out); break;
+        if (rows == 1) {
+            switch (d_type) {
+                GLMF_DN_R(16, 1) GLMF_DN_R(18, 1) GLMF_DN_R(19, 1) GLMF_DN_R(23, 1) GLMF_DN_R(10, 1)
+                GLMF_DN_R(11, 1) GLMF_DN_R(17, 1) GLMF_DN_R(22, 1) GLMF_DN_R(21, 1) GLMF_DN_R(29, 1)
+                GLMF_DN_R(12, 1) GLMF_DN_R(13, 1) GLMF_DN_R(14, 1) GLMF_DN_R(8, 1)
+                default: done = false; break;
+            }
+        } else {
+            switch (d_type) {
+                GLMF_DN_R(16, 2) GLMF_DN_R(18, 2) GLMF_DN_R(19, 2) GLMF_DN_R(23, 2) GLMF_DN_R(10, 2)
+                GLMF_DN_R(11, 2) GLMF_DN_R(17, 2) GLMF_DN_R(22, 2) GLMF_DN_R(21, 2) GLMF_DN_R(29, 2)
+                GLMF_DN_R(12, 2) GLMF_DN_R(13, 2) GLMF_DN_R(14, 2) GLMF_DN_R(8, 2)
+                default: done = false; break;
+            }
+        }
+#undef GLMF_DN_R
+        if (done) { launch_check("moe_down rows"); return; }
+    }
     const int blocks = n_embd / DOWN_ROWS;   // n_embd % DOWN_ROWS == 0 (4096)
     const auto* H = (const block_q8_1*) hq;
     switch (d_type) {
@@ -7468,6 +7697,17 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n
         }
     }
     launch_check("moe_experts_multi");
+    // the ledger's rows for this call (R78): the window's experts - each of the T tokens' k routed experts reads its
+    // gate/up rows and its down rows, and the shared expert rides the same gate/up launch (as moe_gate_up notes it).
+    // Without this the batched window's account read as zero experts, which is a gap, not a measurement.
+    if (stage_ledger_on()) {
+        stage_ledger_note(gu_type, T, n_embd, 2 * n_ff, (uint64_t) k * T);
+        if (sh) {
+            stage_ledger_note(sh_type, T, n_embd, 2 * n_ff_sh, T);
+            stage_ledger_note(sh_type, T, n_ff_sh, n_embd, T);
+        }
+        stage_ledger_note(d_type, T, n_ff, n_embd, (uint64_t) k * T);
+    }
     return true;
 #else
     (void) gu_type, (void) d_type, (void) d_in, (void) k, (void) n_embd, (void) n_ff, (void) limit, (void) down_off;
@@ -7674,6 +7914,14 @@ bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s, b
     }
     moe_win_combine_kernel<<<dim3((unsigned) ((w.n_embd + 255) / 256), (unsigned) w.T), 256, 0, s>>>(w);
     launch_check("moe_win_experts");
+    // the ledger's row for this call (R78): the batched window's experts - T tokens' G groups, each a routed expert's
+    // gate/up rows and down rows.  Without it the batched window's account read as pure dense zero-expert, which is
+    // not a measurement of anything (moe_experts_multi, the token path's, notes these the same way).
+    if (stage_ledger_on()) {
+        const uint64_t g = (uint64_t) std::min(G, w.T * w.k);
+        stage_ledger_note(gu_type, w.T, w.n_embd, 2 * w.n_ff, g);
+        stage_ledger_note(d_type, w.T, w.n_ff, w.n_embd, g);
+    }
     return true;
 }
 
