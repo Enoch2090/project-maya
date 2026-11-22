@@ -1050,6 +1050,7 @@ public:
     void win_commit_wait();
     bool win_reserve(std::string& err);                    // the window's buffers and state backup, before the pool
     void win_prof_report();                                // MAYA_GLM_WIN_PROF: each part's window time, then reset
+    void win_ledger_report(Glm5Model* m);                  // MAYA_GLM_R63_STAGE: one part's window stage bytes
     // ---- the DFlash drafter (src/core/glm_dflash.cu): the part with the head holds it, on its device
     std::unique_ptr<GlmDflash> dflash_;
     std::string dflash_path_;                              // MAYA_GLM_DFLASH: its GGUF (every part knows it)

@@ -4731,8 +4731,12 @@ class Service:
                                          if held.endswith(s[:j])), default=0)
                                 text, held = held[:len(held) - k], held[len(held) - k:]
                         was = parser.state
+                        if os.environ.get("MAYA_TOOLDBG") and (CALL_START in text or "tool_call" in (text or "")):
+                            print(f"[tooldbg] feed state={was} text={text[:200]!r}", flush=True)
                         evs = with_lp(parser.close_reasoning() if end_think and parser.token_only_end
                                       else parser.feed(text), was)
+                        if os.environ.get("MAYA_TOOLDBG") and any(e.kind.startswith("tool") for e in evs):
+                            print(f"[tooldbg] emitted {[(e.kind, str(getattr(e,'text',''))[:40]) for e in evs if e.kind.startswith('tool')]}", flush=True)
                         self._say_malformed(parser)
                         self._note(n, evs, stat)
                         last_print = self._progress(last_print)

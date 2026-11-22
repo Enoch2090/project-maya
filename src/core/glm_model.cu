@@ -3763,7 +3763,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     if (!dflash_path_.empty() && l1_ == g_.n_layers) {
         if (!fast_mode_)
             std::fprintf(stderr, "glm dflash: the draft needs the fast path (MAYA_GLM_SLOW is set) - drafting off\n");
-        else if (!dflash_load(dflash_path_, dev_, err))
+        else if (!dflash_load(dflash_path_, GlmDflash::want_dev(dev_), err))   // MAYA_GLM_DFLASH_DEV
             return false;
     }
     if (fast_mode_ && !fast_setup(err)) return false;

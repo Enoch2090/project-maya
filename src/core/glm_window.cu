@@ -1242,6 +1242,8 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
                 ++W.u_layers;
             }
         }
+        // MAYA_GLM_R63_STAGE: the batched window's stages for all T tokens at once (this thread enqueued them)
+        if (gf::stage_ledger_on()) gf::stage_ledger_wcommit(m->dev_, T);
         if (W.ev_n == 0) continue;
         for (size_t i = 1; i < W.ev_n; ++i) {
             float a = 0.0f;
@@ -1396,6 +1398,9 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
             cudaMemcpyAsync(W.hop_h + (size_t) sl * hcE, m->state_, hcE * sizeof(float), cudaMemcpyDeviceToHost, F->cs);
         }
         cudaEventRecord(W.ev_tok[sl], F->cs);
+        // MAYA_GLM_R63_STAGE: this part's closed window stages into the window ledger (bytes need no sync; the
+        // pipelined decode never reaches window()'s collect(), so this thread's account would otherwise be dropped)
+        if (gf::stage_ledger_on()) gf::stage_ledger_wcommit(m->dev_);
         return true;
     }
     // the last part: this token's pick now - its head row, the output GEMV, the argmax (or row t's draw at the
@@ -1426,6 +1431,7 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     gf::set_skip(nullptr);
     cudaMemcpyAsync(W.tok_h + sl, W.tok + sl, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
     cudaEventRecord(W.ev_pick[sl], F->cs);
+    if (gf::stage_ledger_on()) gf::stage_ledger_wcommit(m->dev_);
     return true;
 }
 
@@ -1887,6 +1893,49 @@ void Glm5Model::win_prof_report() {
                          m->dev_, (double) W.u_distinct / W.u_layers, (double) W.u_picks / W.u_layers,
                          100.0 * (double) W.u_distinct / (double) std::max<int64_t>(1, W.u_picks));
         W.u_layers = W.u_distinct = W.u_picks = 0;
+        if (gf::stage_ledger_on()) win_ledger_report(m);
+    }
+}
+
+// MAYA_GLM_R63_STAGE: the verify window's stage -> type -> bytes table for one part (see stage_ledger_wcommit).
+// Decode's bytes exist only here: the token path's table in glm_fast_path.cu describes the prompt's single-column
+// passes, and the pipelined decode runs win_pipe_begin/push/pick/settle, which never reach collect().
+void Glm5Model::win_ledger_report(Glm5Model* m) {
+    struct Row {
+        std::string stage;
+        int type = 0, ncol = 0;
+        uint64_t jobs = 0, passes = 0;
+        double bytes = 0;
+        int64_t n_in = 0, n_out = 0;
+    };
+    std::vector<Row> rows;
+    uint64_t wtok = 0;
+    gf::stage_ledger_wget(
+        m->dev_,
+        [](void* c, const char* stage, int type, int ncol, uint64_t jobs, double bytes, uint64_t passes, int64_t n_in,
+           int64_t n_out) {
+            static_cast<std::vector<Row>*>(c)->push_back(
+                Row{stage, type, ncol, jobs, passes, bytes, n_in, n_out});
+        },
+        &rows, &wtok);
+    if (rows.empty() || wtok == 0) return;
+    std::sort(rows.begin(), rows.end(),
+              [](const Row& a, const Row& b) { return a.bytes != b.bytes ? a.bytes > b.bytes : a.stage < b.stage; });
+    double tot = 0;
+    for (const auto& r : rows) tot += r.bytes;
+    const double nt = (double) wtok;
+    std::fprintf(stderr, "glm window gemv ledger CUDA%d (%llu window tokens, %.1f MB a token of weight rows):\n",
+                 m->dev_, (unsigned long long) wtok, tot / nt / 1e6);
+    // the arithmetic's own check (R75's rule): a row's bytes must be row_bytes(type, n_in) * n_out * jobs, and its
+    // jobs must repeat `passes` times over the tokens it ran in - a row whose numbers do not close is not a row
+    for (const auto& r : rows) {
+        const size_t rb = gf::row_bytes(r.type, r.n_in);
+        const double pred = (double) rb * (double) r.n_out * (double) r.jobs;
+        std::fprintf(stderr, "  %-18s type %-3d nc=%-3d jobs=%-8llu passes=%-6llu n_in=%-6lld n_out=%-6lld %9.2f MB/tok "
+                             "%5.1f%%  arith %.1f MB %s\n", r.stage.c_str(), r.type, r.ncol,
+                     (unsigned long long) r.jobs, (unsigned long long) r.passes, (long long) r.n_in, (long long) r.n_out,
+                     r.bytes / nt / 1e6, 100.0 * r.bytes / std::max(1e-9, tot), pred / nt / 1e6,
+                     std::fabs(pred - r.bytes) <= 1e-6 * std::max(1.0, r.bytes) ? "ok" : "MISMATCH");
     }
 }
 

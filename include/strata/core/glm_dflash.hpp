@@ -89,6 +89,16 @@ public:
     /// Forget every cached position at or past `from` (0: a new sequence, or a state loaded from elsewhere; else the
     /// sequence went back to `from` and the positions after it will hold other tokens).
     void reset(int64_t from = 0);
+    /// MAYA_GLM_DFLASH_DEV=<n>: the drafter runs on device n, not on the part with the head.  The head a draft reads is
+    /// the target's output head, whose weights live in the head part's arena - so the drafter keeps a copy of that row
+    /// block on its own device and reads it there.  `src` is the target's slot, `src_dev` the device it sits on.  A copy
+    /// that will not allocate is not fatal: head_local() stays null and the draft reads the target's rows over the link.
+    bool head_copy(const WSlot& src, int src_dev, std::string& err);
+    /// The drafter's own copy of the target's head (nullptr: read the target's - the drafter on the head's device).
+    const WSlot* head_local() const;
+    /// The device the drafter was asked to run on (MAYA_GLM_DFLASH_DEV, else `fallback`): what load() and the bind use.
+    static int want_dev(int fallback);
+
     /// The last draft's mask rows (tests): their final normed hidden states (n x hidden), their candidates and logits
     /// (n x top_k), the walk's picks and confidences (n).
     bool last_rows(int n, std::vector<float>& hidden, std::vector<int>& cand, std::vector<float>& logit,

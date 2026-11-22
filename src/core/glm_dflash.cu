@@ -659,6 +659,10 @@ struct GlmDflash::Impl {
     int sel_type = 0;
     void* arena = nullptr;
     size_t arena_bytes = 0;
+    // the target's output head on this device (head_copy): a drafter off the head's part reads its rows here
+    void* hcopy = nullptr;
+    WSlot hslot;
+    bool hslot_ok = false;
     // the K/V ring: per layer ring x (n_kv x 128) FP16 keys and values; kv_pos[slot]: the position held (-1 none)
     __half *Kr = nullptr, *Vr = nullptr;
     long long* kv_pos = nullptr;
@@ -728,6 +732,7 @@ GlmDflash::~GlmDflash() {
     cudaGetDevice(&cur);
     cudaSetDevice(d_->dev);
     if (d_->arena) cudaFree(d_->arena);
+    if (d_->hcopy) cudaFree(d_->hcopy);
     if (d_->buf) cudaFree(d_->buf);
     if (d_->Kr) cudaFree(d_->Kr);
     if (d_->Vr) cudaFree(d_->Vr);
@@ -744,6 +749,79 @@ GlmDflash::~GlmDflash() {
 }
 
 int GlmDflash::dev() const { return d_->dev; }
+
+// MAYA_GLM_DFLASH_DEV=<n>: the drafter's device.  Unset: `fallback`, the part with the head - the arrangement every
+// measurement before R83 ran (the drafter then shares that card with the pipelined window's last segment, and the
+// window's first pick waits for whichever of the two the card runs first).
+int GlmDflash::want_dev(int fallback) {
+    const char* v = getenv("MAYA_GLM_DFLASH_DEV");
+    if (v == nullptr || v[0] == '\0') return fallback;
+    const int d = std::atoi(v);
+    if (d < 0 || d == fallback) return fallback;
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess || d >= n) {
+        cudaGetLastError();
+        std::fprintf(stderr, "glm dflash: MAYA_GLM_DFLASH_DEV=%s is not a device (0..%d): the drafter stays on CUDA%d\n",
+                     v, n - 1, fallback);
+        return fallback;
+    }
+    return d;
+}
+
+const WSlot* GlmDflash::head_local() const { return d_->hslot_ok ? &d_->hslot : nullptr; }
+
+// The target's output head is a row block of quantized weights in the head part's arena; a drafter on another device
+// reads the same rows best from its own copy (the link is 0.41 ms of fixed latency and ~52 GB/s here, against a local
+// read of the same rows at the card's 769 GB/s - a draft's head is one GEMV of the whole block).
+bool GlmDflash::head_copy(const WSlot& src, int src_dev, std::string& err) {
+    Impl& m = *d_;
+    if (src.n_in <= 0 || src.n_out <= 0) {
+        err = "glm dflash: the head has no shape to copy";
+        return false;
+    }
+    size_t row = 0;
+    if (src.type == gf::kTypeF32) row = (size_t) src.n_in * 4;
+    else if (src.type == gf::kTypeBF16) row = (size_t) src.n_in * 2;
+    else row = gf::row_bytes(src.type, src.n_in);
+    if (row == 0) {
+        err = "glm dflash: the head's type " + std::to_string(src.type) + " has no row size to copy";
+        return false;
+    }
+    const size_t bytes = row * (size_t) src.n_out;
+    const void* from = src.type == gf::kTypeF32 || src.type == gf::kTypeBF16 ? (const void*) src.f32 : src.q;
+    if (from == nullptr) {
+        err = "glm dflash: the head is not loaded";
+        return false;
+    }
+    int cur = 0;
+    cudaGetDevice(&cur);
+    cudaSetDevice(m.dev);
+    void* dst = nullptr;
+    cudaError_t e = cudaMalloc(&dst, bytes);
+    if (e == cudaSuccess) e = cudaMemcpyPeer(dst, m.dev, from, src_dev, bytes);
+    if (e == cudaSuccess) e = cudaDeviceSynchronize();
+    cudaSetDevice(cur);
+    if (e != cudaSuccess) {
+        cudaGetLastError();
+        if (dst != nullptr) {
+            cudaSetDevice(m.dev);
+            cudaFree(dst);
+            cudaSetDevice(cur);
+        }
+        std::fprintf(stderr, "glm dflash: the head's %.0f MB did not copy to CUDA%d (%s): a draft reads CUDA%d's rows "
+                             "over the link instead\n",
+                     (double) bytes / 1048576.0, m.dev, cudaGetErrorString(e), src_dev);
+        return true;   // degraded, not fatal - head_local() stays null and the draft uses the target's slot
+    }
+    m.hcopy = dst;
+    m.hslot = src;
+    if (src.type == gf::kTypeF32 || src.type == gf::kTypeBF16) m.hslot.f32 = (const float*) dst;
+    else m.hslot.q = dst;
+    m.hslot_ok = true;
+    std::fprintf(stderr, "glm dflash: the head's %.0f MB copied to CUDA%d (a draft reads it there)\n",
+                 (double) bytes / 1048576.0, m.dev);
+    return true;
+}
 
 // The drafter's stream at the device's highest priority: a round's drafts gate every draft token's entry into the
 // pipelined window, and at the round's start the head's card is still running the layer a cancelled token was in
@@ -794,6 +872,7 @@ std::string GlmDflash::describe() const {
 
 bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
     Impl& m = *d_;
+    dev = want_dev(dev);   // MAYA_GLM_DFLASH_DEV: its own card, off the part that holds the head
     m.dev = dev;
     m.path = path;
     std::unique_ptr<strata::GgufFile> gf_;
@@ -1632,11 +1711,9 @@ bool Glm5Model::dflash_bind(std::string& err) {
         err = "glm dflash: the NextN (MTP) draft block is loaded too - DFlash replaces it (MAYA_GLM_NO_MTP=1)";
         return false;
     }
-    if (tail->dev_ != D->dev()) {
-        err = "glm dflash: the draft sits on CUDA" + std::to_string(D->dev()) + ", the head on CUDA" +
-              std::to_string(tail->dev_);
-        return false;
-    }
+    // the draft need not sit on the head's part: it reads the head's rows, which it can hold a copy of (head_local).
+    // What it may not do is read another device's rows without one, or a split head whose halves are elsewhere.
+    const bool off_head = tail->dev_ != D->dev();
     if (!D->bind(g_.n_embd, g_.n_vocab, g_.n_layers, err)) return false;
     const auto& tl = D->target_layers();
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -1656,7 +1733,14 @@ bool Glm5Model::dflash_bind(std::string& err) {
     }
     // the drafts' head on the head split too: its helper idles while the drafter runs (the round's anchor is on the
     // first parts then)
-    if (tail->head_split_ready()) {
+    if (off_head) {
+        // the drafter has the whole head on its own card: a split across the head's two cards would move the rows it
+        // just copied, and would run a draft's GEMV on the very card it was moved off
+        const auto ho = tail->ws_map_.find("output.weight");
+        if (ho != tail->ws_map_.end() && !D->head_copy(ho->second, tail->dev_, err)) return false;
+        std::fprintf(stderr, "glm dflash: MAYA_GLM_DFLASH_DEV=%d - the drafter is off the head's CUDA%d; no head split "
+                             "for its drafts\n", D->dev(), tail->dev_);
+    } else if (tail->head_split_ready()) {
         Glm5Model* h = tail->head_helper_;
         const auto lo = tail->ws_map_.find("output.weight.lo");
         const auto hi = h->ws_map_.find("output.weight.hi");
@@ -1738,7 +1822,8 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
     const int n_max_req = n_max;
     if (n_max < 0) n_max = D.block() - 1;   // the default: the drafter's whole block (see below for a split)
     n_max = std::max(1, std::min({n_max, D.block() - 1, kWinMax - 1}));
-    const WSlot& head = tail->ws_map_.at("output.weight");
+    // a drafter on a device of its own (MAYA_GLM_DFLASH_DEV) reads the head from its copy there
+    const WSlot& head = D.head_local() != nullptr ? *D.head_local() : tail->ws_map_.at("output.weight");
     static const bool prof = getenv("MAYA_GLM_DFLASH_PROF") != nullptr;
     // MAYA_GLM_DFLASH_TL=<file>: a line a pipelined round - ms from its anchor's start: drafts ready, drafts pushed,
     // each pick (the tokens out of the last part), the commit done
@@ -1829,7 +1914,7 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
             cudaSetDevice(m->dev_);
             cudaStreamSynchronize(m->fast_->cs);
         }
-        cudaSetDevice(tail->dev_);
+        cudaSetDevice(D.dev());
         cudaStreamSynchronize(ts);
         cudaSetDevice(dev_);
     };
@@ -2016,7 +2101,7 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
             const int room2 = (int) std::min<int64_t>(n_max, max_ctx_ - N2 - 1);
             const int nd2 = explore ? D.block() - 1 : room2;
             const float pm2 = explore ? 0.0f : p_min;
-            const int dev_t = tail->dev_;
+            const int dev_t = D.dev();
             const uint8_t* emb = pack_emb_src_;
             const int emb_type = pack_emb_type_;
             ahead.kick([&D, &head, ts, dev_t, N, N2, room2, nd2, pm2, y2, emb, emb_type](std::string& e) {
