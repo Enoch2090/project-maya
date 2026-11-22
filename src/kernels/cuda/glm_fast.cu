@@ -791,6 +791,17 @@ template<> struct TabWords<17> { static constexpr int n = 1024; };
 template<> struct TabWords<22> { static constexpr int n = 2048; };
 template<> struct TabWords<21> { static constexpr int n = 512; };
 template<> struct TabWords<29> { static constexpr int n = 2048; };
+// R2 (2026-11-23): IQ4_XS's codebook in SHARED memory.  iq4nl_lut expands a nibble-pair with two __byte_perm, and on
+// this part (MUSA mp_22, MTT S4000) __byte_perm issues at 19.96 G expansions/s a card while four shared-byte loads
+// with three shifts do 105.96 G/s - measured, /tmp/alutest.mu, two blocks a SM.  moe_down type 23 is 34 of Maya-L's
+// 42 layers' down matrix and its call is ALU-bound, not bandwidth-bound: the same reads with the dequant removed run
+// 537.5 GB/s against the shipped 50.7 GB/s, and the codebook alone (no dots) is 63.5 GB/s.  With the codebook moved
+// to shared memory the engine's own moe_down type 23 falls 0.759 -> 0.362 ms (47.0 -> 98.4 GB/s, 2.10x), and on
+// Maya-L at 32K ctx + 32K out decode goes 64.29 -> 57.41 ms/token (15.55 -> 17.42 tok/s), prefill flat.
+// Output is bit-identical: same dot order, the same 16 bytes, checked over 32 768 outputs of the real dw<23>
+// (/tmp/lutfinal.mu) and over 8.4 M expansions of the table itself (/tmp/lutcheck2.mu).  Entries are kvalues_iq4nl
+// zero-extended, one byte each, so the shifts cannot drag a sign in.
+template<> struct TabWords<23> { static constexpr int n = 16; };
 template<int T>
 __device__ __forceinline__ void load_tab(uint32_t* s_tab) {
     const uint32_t* src = T == 19 || T == 29 ? (const uint32_t*) iq1s_grid_gpu
@@ -799,7 +810,25 @@ __device__ __forceinline__ void load_tab(uint32_t* s_tab) {
                           : T == 17 ? (const uint32_t*) iq2xs_grid
                           : T == 22 ? (const uint32_t*) iq2s_grid
                           : T == 21 ? (const uint32_t*) iq3s_grid : nullptr;
+    if constexpr (T == 23) {
+        // one word an entry, the entry the codebook byte zero-extended (not sign-extended: the dot multiplies a
+        // packed byte lane, and iq4nl_lut's immediates carry the same 0x81/0x98/...  bytes, so zero-extension is
+        // the form that matches it - see the decode of the two immediate words in the R2 notes)
+        const int8_t* kv = kvalues_iq4nl;
+        for (int i = threadIdx.x; i < 16; i += blockDim.x) s_tab[i] = (uint32_t) (uint8_t) kv[i];
+        return;
+    }
     for (int i = threadIdx.x; i < TabWords<T>::n; i += blockDim.x) s_tab[i] = src[i];
+}
+// the shared-memory form of iq4nl_lut: a nibble-pair's four bytes gathered from the 16-entry table above.
+// Bit-identical to iq4nl_lut (checked over every input slice, /tmp/lutcheck2.mu), fewer issued instructions.
+__device__ __forceinline__ int iq4nl_lut_smem(int v, int shift, const uint32_t* tab) {
+    const uint32_t q = ((uint32_t) v >> shift) & 0x0F0F0F0Fu;
+    return (int) (tab[q & 0xFu] | (tab[(q >> 8) & 0xFu] << 8) | (tab[(q >> 16) & 0xFu] << 16) |
+                  (tab[(q >> 24) & 0xFu] << 24));
+}
+__device__ __forceinline__ int2 iq4nl_16_smem(const int& q4, const uint32_t* tab) {
+    return make_int2(iq4nl_lut_smem(q4, 0, tab), iq4nl_lut_smem(q4, 4, tab));
 }
 // ---- the activation half of a dot, loaded ONCE and reused across rows: every i-quant call k reads exactly one
 // q8_1 block (index kbx * qk/32 + k % ipb) and all 8 of its ints
@@ -911,13 +940,15 @@ template<> __device__ __forceinline__ float dw<18>(const uint8_t* row, int kbx, 
     sumi = (ls * sumi + sumi / 2) / 2;
     return __half2float(bq3->d) * x.d * sumi;
 }
-template<> __device__ __forceinline__ float dw<23>(const uint8_t* row, int kbx, int iqs, const XV& x, const uint32_t*) {
+template<> __device__ __forceinline__ float dw<23>(const uint8_t* row, int kbx, int iqs, const XV& x, const uint32_t* tab) {
     const block_iq4_xs* bq4 = (const block_iq4_xs*) row + kbx;
     int sumi = 0;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
-        const int2 v = iq4nl_16(aux_q4);
+        // R2: the codebook from shared memory when the caller staged it (the expert kernels do), the immediate
+        // expression otherwise (the dense GEMV's launches pass no table).
+        const int2 v = tab != nullptr ? iq4nl_16_smem(aux_q4, tab) : iq4nl_16(aux_q4);
         sumi = __dp4a(v.x, x.u[j + 0], sumi);
         sumi = __dp4a(v.y, x.u[j + 4], sumi);
     }
