@@ -1116,8 +1116,64 @@ template<> __device__ __forceinline__ float dw<29>(const uint8_t* row, int kbx, 
 // down 167 -> 156, IQ3_S down 195 -> 185; IQ2_S keeps the two masks (the +1s by an AND: less shared-memory traffic,
 // faster for it), IQ3_* the masks with their +1s.
 template<int T> constexpr bool sm60_sign_on = GLMF_SM60 && (T == 18 || T == 21 || T == 22);
+// R3: the same 256-entry sign table, used ON MUSA.  hip_fast_signs expands a sign byte in 4 multiplies; a table
+// lookup is one shared load.  The engine already had this path (dws<T> / sm60_sign) but it is compiled only for
+// the cc-6.0 emulation, which is 0 here, so the shipped MUSA experts never used it.  Measured on the isolated
+// IQ3_S gate/up at the engine's own geometry: 99.6 -> 110.0 GB/s (/tmp/gusign.mu, 32 warps, grid (64,8), 57.7 MB).
+// The table is the same function of the same sign byte, so the dot is bit-identical (checked in /tmp/signfix.mu).
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
+template<int T> constexpr bool sign_tab_on = (T == 21);
+#else
+template<int T> constexpr bool sign_tab_on = false;
+#endif
 template<int T> constexpr int sm60_sign_n = T == 18 ? 128 : 256;
 template<int T> constexpr int sm60_sign_w = T == 22 ? 2 : 4;   // u32 words an entry
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
+// R3: dw<21> through the 256-entry sign table.  Same bytes as dw<21>: the table holds, for a sign byte, the byte
+// masks (0xff where negated) and their 0x01010101 low bits, so (g ^ m) + (m & 0x01010101) is __vsub4(g ^ m, m) -
+// IQ3_S's grid bytes are all nonzero, so negating never carries between bytes.  The table is filled by
+// load_signs<T> (the LUT form already in this file), so nothing new is computed.
+// The table is filled by the SAME expansion the direct path uses, so the two cannot disagree: hip_fast_signs is
+// the shipped form, and 256 lookups of it are exactly the 256 sign bytes.
+__device__ __forceinline__ void load_sign_tab21(uint4* t) {
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) t[i] = hip_fast_signs((unsigned) i, false);
+}
+template<int T> __device__ __forceinline__ float dw_tab(const uint8_t* row, int kbx, int iqs, const XV& x,
+                                                        const uint32_t* tab, const uint4* st);
+template<> __device__ __forceinline__ float dw_tab<21>(const uint8_t* row, int kbx, int iqs, const XV& x,
+                                                       const uint32_t* tab, const uint4* st) {
+    const block_iq3_s* bq3 = (const block_iq3_s*) row + kbx;
+    const int2 qs_packed = make_int2(get_int_b2_merged(bq3->qs, iqs + 0), get_int_b2_merged(bq3->qs, iqs + 1));
+    const uint8_t* qs = (const uint8_t*) &qs_packed;
+    const int qh = bq3->qh[iqs / 2];
+    const int signs_packed_32 = get_int_b2_merged(bq3->signs, iqs / 2);
+    const uint8_t* sp8 = (const uint8_t*) &signs_packed_32;
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(tab[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+                                        tab[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+        const uint4 sgn = st[sp8[l0 / 2]];
+        sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[l0 + 0], sumi);
+        sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[l0 + 1], sumi);
+    }
+    sumi *= 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    return __half2float(bq3->d) * x.d * sumi;
+}
+// the same rows loop, but each row's dot through the sign table
+template<int T, int NR>
+__device__ __forceinline__ void rows_dot_tab(const uint8_t* const* rows, const block_q8_1* x, int n_in, int lane,
+                                             const uint32_t* tab, const uint4* st, float* s) {
+    float acc[NR] = {};
+    for (int k = lane; k < n_in / 32; k += 32) {
+        const XV xv = load_xv<T == 16 || T == 22>(x + k);
+#pragma unroll
+        for (int r = 0; r < NR; ++r) acc[r] += dw_tab<T>(rows[r], k / 8, 2 * (k % 8), xv, tab, st);
+    }
+#pragma unroll
+    for (int r = 0; r < NR; ++r) s[r] = warp_sum(acc[r]);
+}
+#endif
 #if GLMF_SM60
 template<int T>
 __device__ __forceinline__ void sm60_load_signs(uint32_t* t) {
@@ -4945,7 +5001,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
                                                                     block_q8_1* __restrict__ hq,
                                                                     const uint8_t* __restrict__ sh_down, int sh_type,
                                                                     const block_q8_1* __restrict__ sh_hq, int n_ff_sh,
-                                                                    float* __restrict__ sh_out) {
+                                                                    float* __restrict__ sh_out, int sign_tab) {
     if (d.skip != nullptr && *d.skip) return;
 #if !(defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     constexpr int NW = GU_WARPS;
@@ -5003,6 +5059,11 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
 #if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
     __shared__ uint4 s_sign[LUT && !DIRECT ? sign_count<TG> : 1];
     if constexpr (LUT && !DIRECT) load_signs<TG>(s_sign);
+    // R3: the 256-entry sign table (4 KB), for the types sign_tab_on<TG> admits when the caller asked for it.
+    __shared__ uint4 s_stab[sign_tab_on<TG> ? 256 : 1];
+    if constexpr (sign_tab_on<TG>) {
+        if (sign_tab) load_sign_tab21(s_stab);
+    }
     if constexpr (!GLOBAL)
 #endif
     load_tab<TG>(s_tab);
@@ -5024,7 +5085,13 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     if constexpr (GLOBAL) tab = TG == 16 ? (const uint32_t*) iq2xxs_grid :
                                 TG == 18 ? (const uint32_t*) iq3xxs_grid : (const uint32_t*) iq2s_grid;
     if constexpr (LUT) {
-        rows_dot_rdna<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s_sign, s, DIRECT, WIDE);
+        // R3: the sign table when the launch asked for it (sign_tab_on<TG> only admits IQ3_S)
+        if constexpr (sign_tab_on<TG>) {
+            if (sign_tab) rows_dot_tab<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s_stab, s);
+            else rows_dot_rdna<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s_sign, s, DIRECT, WIDE);
+        } else {
+            rows_dot_rdna<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s_sign, s, DIRECT, WIDE);
+        }
     } else
 #endif
 #if GLMF_SM60
@@ -7431,6 +7498,16 @@ void note_gu22(bool tuned, int path) {
     std::fprintf(stderr, "glm experts: CUDA%d IQ2_S gate/up on the %s kernel (%s)\n", dev, tuned ? "tuned RDNA" : "original",
                  path ? "multi-token launch" : "token path");
 }
+// R3: IQ3_S's gate/up sign expansion through a 256-entry shared table instead of hip_fast_signs' four multiplies.
+// Measured 99.6 -> 110.0 GB/s on the isolated kernel at the engine's geometry (/tmp/gusign.mu).  MAYA_GLM_GU_SIGNS=0
+// is the A/B against the shipped direct form.
+bool gu_sign_tab() {
+    static const bool on = [] {
+        const char* v = std::getenv("MAYA_GLM_GU_SIGNS");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
 // R3: the routed gate/up launch's block width for IQ3_S (type 21).  NW=32 (the shipped value) is 1024 threads a
 // block, which on this part is one block a SM (regsPerBlock 131072); NW=16 is 512, two a SM.  The block's rows all
 // wait on one 8-byte device read (d.plan_ptr[ei]) before any address exists, so the second resident block is what
@@ -7462,7 +7539,7 @@ void launch_expert_gu(const MoeDev& d, int k, int n_embd, int n_ff, float limit,
     const dim3 grid(n_ff / GU_ROWS, k + (shared && !SPLIT ? 1 : 0));
     moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES><<<grid, NW * 32, 0, s>>>(d, shared ? k : k + 1, n_embd, n_ff,
         limit, (const block_q8_1*) xq, (block_q8_1*) hq, (const uint8_t*) sh_down, sh_type,
-        (const block_q8_1*) sh_hq, n_ff_sh, sh_out);
+        (const block_q8_1*) sh_hq, n_ff_sh, sh_out, (T == 21 && NW == 32) ? (int) gu_sign_tab() : 0);
     if constexpr (SPLIT) {
         if (shared) rdna_shared_down_kernel<<<(n_embd + 7) / 8, 256, 0, s>>>(
             (const uint8_t*) sh_down, sh_type, (const block_q8_1*) sh_hq, n_ff_sh, n_embd, sh_out);
@@ -7559,7 +7636,7 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     switch (gu_type) {
 #define GLMF_GU(T) \
         case T: moe_gate_up_kernel<T><<<grid, GU_WARPS * 32, gx, s>>>(d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, \
-                                                                      n_ff_sh, sh_out); break;
+                                                                      n_ff_sh, sh_out, 0); break;
         GLMF_GU(16) GLMF_GU(18) GLMF_GU(19) GLMF_GU(23) GLMF_GU(10) GLMF_GU(11) GLMF_GU(17) GLMF_GU(22) GLMF_GU(21) GLMF_GU(29)
         GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(8)
 #undef GLMF_GU
@@ -7734,15 +7811,15 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n
     if (tuned) {
         if (gu_type == 16)
             moe_gate_up_kernel<16, 16, true, false, false, true, false, 0, true><<<ggu, 16 * 32, 0, s>>>(
-                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
+                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out, 0);
         else
             moe_gate_up_kernel<22, 16, true, false, false, true, false, 0, true><<<ggu, 16 * 32, 0, s>>>(
-                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
+                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out, 0);
     } else {
         switch (gu_type) {
 #define GLMF_GUM(TT) \
             case TT: moe_gate_up_kernel<TT, GU_WARPS, false, false, false, false, false, 0, true><<<ggu, GU_WARPS * 32, 0, s>>>( \
-                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out); break;
+                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out, 0); break;
             GLMF_GUM(16) GLMF_GUM(18) GLMF_GUM(19) GLMF_GUM(23) GLMF_GUM(10) GLMF_GUM(11) GLMF_GUM(17) GLMF_GUM(22)
             GLMF_GUM(21) GLMF_GUM(29) GLMF_GUM(12) GLMF_GUM(13) GLMF_GUM(14)
 #undef GLMF_GUM
