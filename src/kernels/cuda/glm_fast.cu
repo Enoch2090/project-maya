@@ -3525,6 +3525,11 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
 // The latents stay FP16 in shared memory, as in the cache (34 KB at kv_lora 512; F32 rows were over Turing's 64 KB).
 constexpr int MLA_CHUNK = 32;
 constexpr int MLA_HPB = 16;
+// R15: threads a block for mla_split2_kernel (the decode token path's take-two attention).  At 256 (8 warps) with
+// HPB 16 a warp runs TWO heads; at 512 (16 warps) it runs one, which doubles an SM's resident warps from 16 to 32 and
+// is the whole of the gain: 556.1 -> 322.4 us a call (-42.0%), bit-identical, measured isolated (/tmp/r15_warps).
+// 1024 (32 warps) is 328.0 - past the head count, so the block sits idle in the score phase; 128 is +91%.
+constexpr int MLA2_THREADS = 512;
 __global__ void __launch_bounds__(256) mla_split_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
                                                         const int* __restrict__ cells, int n_sel, int n_head, int qk_nope,
                                                         int kv_lora, float* __restrict__ part, bool q8) {
@@ -3614,7 +3619,7 @@ __global__ void mla_combine_kernel(const float* __restrict__ part, int n_chunks,
 // staged 16 bytes a lane (V, FP16 latents) instead of a division and a 2-byte load an element; and the merge
 // (mla_combine2_kernel) takes each chunk's exp factor once a block instead of once a column, 128 columns a block.
 template<int HPB, bool L, bool V>
-__global__ void __launch_bounds__(256) mla_split2_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+__global__ void __launch_bounds__(MLA2_THREADS, 2) mla_split2_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
                                                          const int* __restrict__ cells, int n_sel, int n_head, int qk_nope,
                                                          int kv_lora, float* __restrict__ part, bool q8) {
     extern __shared__ float smem[];
@@ -3671,12 +3676,25 @@ __global__ void __launch_bounds__(256) mla_split2_kernel(const float* __restrict
         }
     }
     __syncthreads();
-    for (int i = tid; i < nh * kv_lora; i += blockDim.x) {
-        const int hh = i / kv_lora, c = i - hh * kv_lora;
-        float acc = 0.0f;
+    // R15: one 32-bit shared read a thread - two adjacent columns - instead of one 16-bit read a column.  A warp whose
+    // lanes read adjacent halves spans 64 B = 16 banks of the 4-byte array, so each read cost two cycles; a 32-bit read
+    // halves the instructions and drops the conflict.  This changes which thread computes which output, not the order
+    // any output accumulates in: a column still sums r = 0..MLA_CHUNK-1 in that order, so the result is the same bit
+    // for bit (isolated: 0 of 2105344 floats differ against the 16-bit loop).  kv_lora % 32 == 0 is already required
+    // by mla_attend's gate, so a pair never straddles a row.
+    for (int i = tid; i < nh * kv_lora / 2; i += blockDim.x) {
+        const int hh = i / (kv_lora / 2), c2 = i - hh * (kv_lora / 2);
+        const int c = 2 * c2;
+        float a0 = 0.0f, a1 = 0.0f;
 #pragma unroll 8
-        for (int r = 0; r < MLA_CHUNK; ++r) acc += sS[hh * MLA_CHUNK + r] * lat_f(sL[r * kv_lora + c]);
-        pm[(size_t) hh * (kv_lora + 2) + c] = acc;
+        for (int r = 0; r < MLA_CHUNK; ++r) {
+            const float2 f = __half22float2(*(const __half2*) (sL + r * kv_lora + c));
+            const float s = sS[hh * MLA_CHUNK + r];
+            a0 += s * f.x;
+            a1 += s * f.y;
+        }
+        pm[(size_t) hh * (kv_lora + 2) + c] = a0;
+        pm[(size_t) hh * (kv_lora + 2) + c + 1] = a1;
     }
 }
 
@@ -7151,7 +7169,7 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
     if (part != nullptr && cap >= n_chunks && t2.on) {
         const size_t smem2 = (size_t) MLA_CHUNK * kv_lora * sizeof(uint16_t) + (size_t) t2.hpb * MLA_CHUNK * sizeof(float);
         const dim3 grid(n_chunks, (n_head + t2.hpb - 1) / t2.hpb);
-#define MLA2(H, L, V) mla_split2_kernel<H, L, V><<<grid, 256, smem2, s>>>(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, part, lat_q8)
+#define MLA2(H, L, V) mla_split2_kernel<H, L, V><<<grid, MLA2_THREADS, smem2, s>>>(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, part, lat_q8)
 #define MLA2_HPB(H) do { if (t2.lanes) { if (t2.vec) MLA2(H, true, true); else MLA2(H, true, false); } \
                          else { if (t2.vec) MLA2(H, false, true); else MLA2(H, false, false); } } while (0)
         if (t2.hpb == 64) MLA2_HPB(64);
