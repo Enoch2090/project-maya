@@ -5004,12 +5004,14 @@ __global__ void moe_cpu_wait_rows_kernel(CpuWaitRows w, int n_embd) {
 
 constexpr int GU_ROWS = 32;   // h values (gate rows = up rows) per block: one q8_1 block of h
 constexpr int GU_WARPS = 16;  // ... 2 gate + 2 up rows per warp (8 per warp measured 90 vs 65 us a layer: occupancy)
+// R6: the words of one q8_1 activation row at the experts' largest n_embd (4096): 1152 words = 4608 B.
+constexpr int R6_GX_WORDS = (4096 / 32) * (int) (sizeof(block_q8_1) / 4);
 
 // grid (n_ff / GU_ROWS, k [+ 1]): the extra row of blocks (blockIdx.y == k) computes the SHARED expert's down rows
 // into sh_out while the routed experts' blocks run - in moe_down it was a serial tail (~25 us of 72)
 #if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 template<int TG, int NW = GU_WARPS, bool LUT = false, bool GLOBAL = false, bool SPLIT = false,
-         bool DIRECT = false, bool WIDE = false, int MINWAVES = 0, bool MULTI = false>
+         bool DIRECT = false, bool WIDE = false, int MINWAVES = 0, bool MULTI = false, bool STG = false>
 __attribute__((amdgpu_waves_per_eu(MINWAVES > 0 ? MINWAVES : 1)))
 __global__ void __launch_bounds__(NW * 32)
 #else
@@ -5059,6 +5061,12 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     if (ptr == 0ull) return;
     __shared__ float sg[GU_ROWS], su[GU_ROWS];
     __shared__ uint32_t s_tab[TabWords<TG>::n > 0 ? TabWords<TG>::n : 1];
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
+    // R6: STG makes the shared pointer, not a run-time branch, choose the activation's address space.  The two
+    // arms are separate instantiations; the branch version measured -15% against the shipped kernel even with the
+    // staging off (the loads lose their address space).  4608 B on top of the codebook + sign tables.
+    __shared__ int s_gx[STG ? R6_GX_WORDS : 1];
+#endif
     const block_q8_1* xg = xq;
 #if GLMF_SM60
     __shared__ __align__(16) uint32_t s_sg[sm60_sign_on<TG> ? sm60_sign_n<TG> * sm60_sign_w<TG> : 1];
@@ -5087,6 +5095,13 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     if constexpr (!GLOBAL)
 #endif
     load_tab<TG>(s_tab);
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
+    if constexpr (STG) {
+        const int nxw = (n_embd / 32) * (int) (sizeof(block_q8_1) / 4);
+        for (int i = threadIdx.x; i < nxw && i < R6_GX_WORDS; i += blockDim.x) s_gx[i] = ((const int*) xq)[i];
+        xg = (const block_q8_1*) s_gx;
+    }
+#endif
     __syncthreads();
     const size_t rb = rbytes<TG>(n_embd);
     const uint8_t* blob = (const uint8_t*) ptr;
@@ -5107,10 +5122,10 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     if constexpr (LUT) {
         // R3: the sign table when the launch asked for it (sign_tab_on<TG> only admits IQ3_S)
         if constexpr (sign_tab_on<TG>) {
-            if (sign_tab) rows_dot_tab<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s_stab, s);
-            else rows_dot_rdna<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s_sign, s, DIRECT, WIDE);
+            if (sign_tab) rows_dot_tab<TG, 2 * RPW>(rows, xg, n_embd, lane, tab, s_stab, s);
+            else rows_dot_rdna<TG, 2 * RPW>(rows, xg, n_embd, lane, tab, s_sign, s, DIRECT, WIDE);
         } else {
-            rows_dot_rdna<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s_sign, s, DIRECT, WIDE);
+            rows_dot_rdna<TG, 2 * RPW>(rows, xg, n_embd, lane, tab, s_sign, s, DIRECT, WIDE);
         }
     } else
 #endif
@@ -7528,6 +7543,24 @@ bool gu_sign_tab() {
     }();
     return on;
 }
+// R6: stage gate/up's activation in shared memory on MUSA.  A block at NW=32 is 1024 threads and all 32 of its
+// warps re-read the same 4.6 KB of q8_1 from global (144 KB a block against the 1760 KB of weights it is there to
+// read).  The engine's GLMF_SM60 path does this already; GLMF_SM60 is 0 on MUSA.
+// Measured on a replica of this kernel's own XV carrier: shipped 0.588 -> staged 0.568 ms (+3.4%), bit-identical
+// on all 65536 pre-quantisation sums - but ONLY when the stage is a compile-time constant.  The same change behind
+// a run-time `if` is 0.678 ms (-15%): the branch leaves xg's address space unknown and the loads go generic.
+// So the switch is a template parameter here, not a kernel argument.  MAYA_GLM_GU_STAGE=0 is the A/B.
+bool musa_gu_stage() {
+#if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
+    static const bool on = [] {
+        const char* v = std::getenv("MAYA_GLM_GU_STAGE");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+#else
+    return false;
+#endif
+}
 // R3: the routed gate/up launch's block width for IQ3_S (type 21).  NW=32 (the shipped value) is 1024 threads a
 // block, which on this part is one block a SM (regsPerBlock 131072); NW=16 is 512, two a SM.  The block's rows all
 // wait on one 8-byte device read (d.plan_ptr[ei]) before any address exists, so the second resident block is what
@@ -7557,9 +7590,25 @@ void launch_expert_gu(const MoeDev& d, int k, int n_embd, int n_ff, float limit,
                const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s) {
     const bool shared = sh_down && sh_out;
     const dim3 grid(n_ff / GU_ROWS, k + (shared && !SPLIT ? 1 : 0));
-    moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES><<<grid, NW * 32, 0, s>>>(d, shared ? k : k + 1, n_embd, n_ff,
-        limit, (const block_q8_1*) xq, (block_q8_1*) hq, (const uint8_t*) sh_down, sh_type,
-        (const block_q8_1*) sh_hq, n_ff_sh, sh_out, (T == 21 && NW == 32) ? (int) gu_sign_tab() : 0);
+    // R6: IQ3_S at NW=32 (the decode path) can stage the activation; every other instantiation is the shipped
+    // program, byte for byte.  The SPLIT tail below runs for BOTH arms - the first cut of this patch returned
+    // early and silently skipped the shared expert's down projection (acceptance 241 -> 60 drafts).
+    const int stab = (T == 21 && NW == 32) ? (int) gu_sign_tab() : 0;
+    const bool stg = (T == 21 && NW == 32) && musa_gu_stage();
+    if constexpr (T == 21 && NW == 32) {
+        if (stg)
+            moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES, false, true><<<grid, NW * 32, 0, s>>>(
+                d, shared ? k : k + 1, n_embd, n_ff, limit, (const block_q8_1*) xq, (block_q8_1*) hq,
+                (const uint8_t*) sh_down, sh_type, (const block_q8_1*) sh_hq, n_ff_sh, sh_out, stab);
+        else
+            moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES, false, false><<<grid, NW * 32, 0, s>>>(
+                d, shared ? k : k + 1, n_embd, n_ff, limit, (const block_q8_1*) xq, (block_q8_1*) hq,
+                (const uint8_t*) sh_down, sh_type, (const block_q8_1*) sh_hq, n_ff_sh, sh_out, stab);
+    } else {
+        moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES><<<grid, NW * 32, 0, s>>>(
+            d, shared ? k : k + 1, n_embd, n_ff, limit, (const block_q8_1*) xq, (block_q8_1*) hq,
+            (const uint8_t*) sh_down, sh_type, (const block_q8_1*) sh_hq, n_ff_sh, sh_out, stab);
+    }
     if constexpr (SPLIT) {
         if (shared) rdna_shared_down_kernel<<<(n_embd + 7) / 8, 256, 0, s>>>(
             (const uint8_t*) sh_down, sh_type, (const block_q8_1*) sh_hq, n_ff_sh, n_embd, sh_out);
