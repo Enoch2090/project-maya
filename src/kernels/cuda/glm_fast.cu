@@ -3618,7 +3618,7 @@ __global__ void mla_combine_kernel(const float* __restrict__ part, int n_chunks,
 // every chunk four times over 64 heads, 64 once), the butterflies across the VALU's lanes (L), the chunk's latent rows
 // staged 16 bytes a lane (V, FP16 latents) instead of a division and a 2-byte load an element; and the merge
 // (mla_combine2_kernel) takes each chunk's exp factor once a block instead of once a column, 128 columns a block.
-template<int HPB, bool L, bool V>
+template<int HPB, bool L, bool V, bool XV>
 __global__ void __launch_bounds__(MLA2_THREADS, 2) mla_split2_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
                                                          const int* __restrict__ cells, int n_sel, int n_head, int qk_nope,
                                                          int kv_lora, float* __restrict__ part, bool q8) {
@@ -3632,7 +3632,29 @@ __global__ void __launch_bounds__(MLA2_THREADS, 2) mla_split2_kernel(const float
     const int ns = min(MLA_CHUNK, n_sel - s0);
     if (tid < MLA_CHUNK) s_cell[tid] = tid < ns ? cells[s0 + tid] : -1;
     __syncthreads();
-    if (V && !q8 && kv_lora % 8 == 0 && ((size_t) lat & 15) == 0) {
+    if (XV) {
+        // R16: stage the row TRANSPOSED (position l*16 + j = column l + 32j), because the score loop reads each lane's
+        // 16 values as 8 adjacent words.  A lane owns columns lane + 32j, which are 32 halves apart, so no row padding
+        // can make them adjacent - R15's "16 bytes of pad a row" was geometrically impossible (padding moves a row's
+        // start, not the stride inside it).  A warp takes one latent row and reads column lane + 32j for j = 0..15, so
+        // each j is one coalesced 64 B warp read and lane l writes its 16 halves (32 B, two uint4s) contiguously.
+        // 32 rows over nw warps, at most two a warp (nw = 16 at MLA2_THREADS).
+        const int rows_a_warp = (MLA_CHUNK + nw - 1) / nw;
+        for (int q2 = 0; q2 < rows_a_warp; ++q2) {
+            const int r = warp + q2 * nw;
+            if (r >= MLA_CHUNK) break;
+            const int cell = s_cell[r];
+            uint16_t v[16];
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+                v[j] = cell < 0 ? (uint16_t) 0 : lat[(size_t) kv_lora * cell + lane + 32 * j];
+            uint4* d = (uint4*) (sL + r * kv_lora + lane * 16);
+            d[0] = make_uint4(*(const uint32_t*) &v[0], *(const uint32_t*) &v[2],
+                              *(const uint32_t*) &v[4], *(const uint32_t*) &v[6]);
+            d[1] = make_uint4(*(const uint32_t*) &v[8], *(const uint32_t*) &v[10],
+                              *(const uint32_t*) &v[12], *(const uint32_t*) &v[14]);
+        }
+    } else if (V && !q8 && kv_lora % 8 == 0 && ((size_t) lat & 15) == 0) {
         const int per = kv_lora / 8;                   // a row's 16-byte pieces (the same halves as the element loop)
         for (int i = tid; i < MLA_CHUNK * per; i += blockDim.x) {
             const int r = i / per, c8 = i - r * per;
@@ -3655,9 +3677,22 @@ __global__ void __launch_bounds__(MLA2_THREADS, 2) mla_split2_kernel(const float
         for (int j = 0; j < 16; ++j) q[j] = (lane + 32 * j) < kv_lora ? qh[lane + 32 * j] : 0.0f;
         for (int r = 0; r < MLA_CHUNK; ++r) {
             float acc = 0.0f;
+            if (XV) {
+                // the lane's 16 values as 8 words instead of 16 halves.  Word i of lane l's run carries j = 2i and
+                // 2i + 1, so the loop still runs j = 0,1,...,15 in that order: the same FMAs on the same values in the
+                // same order, so the same bits (isolated: 0 of 2105344 floats differ, both layouts, three rounds).
+                const uint32_t* w = (const uint32_t*) (sL + r * kv_lora + lane * 16);
 #pragma unroll
-            for (int j = 0; j < 16; ++j)
-                if (lane + 32 * j < kv_lora) acc += q[j] * lat_f(sL[r * kv_lora + lane + 32 * j]);
+                for (int i = 0; i < 8; ++i) {
+                    const float2 f = __half22float2(*(const __half2*) &w[i]);
+                    acc += q[2 * i] * f.x;
+                    acc += q[2 * i + 1] * f.y;
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 16; ++j)
+                    if (lane + 32 * j < kv_lora) acc += q[j] * lat_f(sL[r * kv_lora + lane + 32 * j]);
+            }
             acc = wsum<L>(acc);
             if (lane == 0) sS[hh * MLA_CHUNK + r] = s_cell[r] >= 0 ? acc * scale : -INFINITY;
         }
@@ -3684,17 +3719,22 @@ __global__ void __launch_bounds__(MLA2_THREADS, 2) mla_split2_kernel(const float
     // by mla_attend's gate, so a pair never straddles a row.
     for (int i = tid; i < nh * kv_lora / 2; i += blockDim.x) {
         const int hh = i / (kv_lora / 2), c2 = i - hh * (kv_lora / 2);
-        const int c = 2 * c2;
+        // R16: a transposed row puts the two halves a word carries 32 columns apart, not adjacent.  This changes which
+        // thread computes which output and which pair shares one read, not the order any output accumulates in: a
+        // column still sums r = 0..MLA_CHUNK-1 in that order, so the same bits.
+        const int c = XV ? (c2 / 8) + 32 * (2 * (c2 % 8)) : 2 * c2;
+        const int c1 = XV ? c + 32 : c + 1;
+        const int off = XV ? (c2 / 8) * 16 + 2 * (c2 % 8) : c;
         float a0 = 0.0f, a1 = 0.0f;
 #pragma unroll 8
         for (int r = 0; r < MLA_CHUNK; ++r) {
-            const float2 f = __half22float2(*(const __half2*) (sL + r * kv_lora + c));
+            const float2 f = __half22float2(*(const __half2*) (sL + r * kv_lora + off));
             const float s = sS[hh * MLA_CHUNK + r];
             a0 += s * f.x;
             a1 += s * f.y;
         }
         pm[(size_t) hh * (kv_lora + 2) + c] = a0;
-        pm[(size_t) hh * (kv_lora + 2) + c + 1] = a1;
+        pm[(size_t) hh * (kv_lora + 2) + c1] = a1;
     }
 }
 
@@ -7169,14 +7209,21 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
     if (part != nullptr && cap >= n_chunks && t2.on) {
         const size_t smem2 = (size_t) MLA_CHUNK * kv_lora * sizeof(uint16_t) + (size_t) t2.hpb * MLA_CHUNK * sizeof(float);
         const dim3 grid(n_chunks, (n_head + t2.hpb - 1) / t2.hpb);
-#define MLA2(H, L, V) mla_split2_kernel<H, L, V><<<grid, MLA2_THREADS, smem2, s>>>(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, part, lat_q8)
-#define MLA2_HPB(H) do { if (t2.lanes) { if (t2.vec) MLA2(H, true, true); else MLA2(H, true, false); } \
-                         else { if (t2.vec) MLA2(H, false, true); else MLA2(H, false, false); } } while (0)
+        const bool xv = kv_lora == 512 && !lat_q8;
+        // R16: the transposed read needs the score loop's 16 j steps to span the row exactly, so only kv_lora == 512
+        // takes it (and not lat_q8, whose rows are dequantised on the fly).  XV is a TEMPLATE argument chosen on the
+        // host: a runtime branch on the address form inside the kernel would make the compiler take one generic path
+        // and cost 15% (R6).
+#define MLA2_XV(H, L, V, X) mla_split2_kernel<H, L, V, X><<<grid, MLA2_THREADS, smem2, s>>>(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, part, lat_q8)
+#define MLA2_SHAPE(H, L, V) do { if (xv) MLA2_XV(H, L, V, true); else MLA2_XV(H, L, V, false); } while (0)
+#define MLA2_HPB(H) do { if (t2.lanes) { if (t2.vec) MLA2_SHAPE(H, true, true); else MLA2_SHAPE(H, true, false); } \
+                         else { if (t2.vec) MLA2_SHAPE(H, false, true); else MLA2_SHAPE(H, false, false); } } while (0)
         if (t2.hpb == 64) MLA2_HPB(64);
         else if (t2.hpb == 32) MLA2_HPB(32);
         else MLA2_HPB(16);
 #undef MLA2_HPB
-#undef MLA2
+#undef MLA2_SHAPE
+#undef MLA2_XV
         if (t2.comb && n_chunks <= kMlaCombine2Max)
             mla_combine2_kernel<<<dim3(n_head, (kv_lora + 127) / 128), 128, 0, s>>>(part, n_chunks, n_head, kv_lora, ctx);
         else
