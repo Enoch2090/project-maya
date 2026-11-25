@@ -772,6 +772,20 @@ public:
     bool spec_ev_live_ = false;
     double spec_dev_ms_ = 0, spec_gap_ms_ = 0;
     int64_t spec_dev_n_ = 0;
+    // R20: this card's busy span and idle time, measured WITHOUT inserting a synchronise (the instrument R19 s7a asked
+    // for).  spec_span_start records a start event at the top of this part's own work for a position - right after the
+    // cudaStreamSynchronize every spec_* entry point already does, so the device is idle and the timestamp is "now";
+    // spec_span_end records the end after the part's last enqueue for that position.  Two positions later the pair is
+    // read back: both events live on this part's own stream, which has been synchronised twice since, so
+    // cudaEventElapsedTime needs no wait.  span = end - start (its work), period = start[n-1] - start[n-2] (one
+    // position's worth of this card's wall), so period - span is the time it sat idle waiting for the part before it.
+    cudaEvent_t spec_per_ev_[4] = {nullptr, nullptr, nullptr, nullptr};   // parity c: [2c] start, [2c+1] end
+    int64_t spec_per_n_ = 0;                        // positions started here (parity of the next = n & 1)
+    double spec_busy_ms_ = 0, spec_idle_ms_ = 0;
+    int64_t spec_per_k_ = 0;                        // spans read back
+    void spec_span_start();
+    void spec_span_end();
+    void spec_span_take();
     float* kda_bak_ = nullptr;                             // the head's saved recurrent states
     bool kda_bak_cur_ = false;   // win_commit_part left kda_bak_ equal to the live states (the next pipelined begin's
                                  // backup is not needed)

@@ -7645,6 +7645,8 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     // draft, CUDA0 finishes the redo q+2 ~8 ms before CUDA1 finishes q+2, so CUDA0 can start q+3 immediately in
     // parallel with CUDA1's q+2 pass using double-buffered hop slot hsl = spec_n_ & 1
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec head sync", err) || !F->route_ok(err)) return false;
+    spec_span_take();    // R20: the span and idle of two positions ago (no wait: this stream is idle now)
+    spec_span_start();   // ... and this position begins
     // MAYA_GLM_SPEC_CANCEL: a speculative pass (decode_spec says so) reads the live word before every layer; it is
     // set now, with the stream idle, so no earlier pass reads it any more.  Other passes (a redo, the confirmed token's)
     // have no gates and never skip.  A head group of one GPU only (decode_spec checks)
@@ -7708,21 +7710,25 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
             cudaSetDevice(m->dev_);
             if (!glmfast::cuda_ok(cudaStreamSynchronize(Fm->cs), "glm spec head part sync", err) ||
                 !Fm->route_ok(err)) return false;
+            m->spec_span_take();
             if (Fm->prof_on) Fm->collect();
             if (!m->fast_boundary(err)) return false;
             m->pos_ = p + 1;
             cudaStreamWaitEvent(Fm->cs, prev->spec_ev_hop_[hsl], 0);
+            m->spec_span_start();   // after the wait: the wait for the predecessor is idle, not work
             cudaMemcpyAsync(m->state_, prev->spec_hop_h_[hsl], hop, cudaMemcpyHostToDevice, Fm->cs);
             if (!m->fast_layers(p, true, err)) return false;
             const int out_sl = (m == hl) ? sl : hsl;
             cudaMemcpyAsync(m->spec_hop_h_[out_sl], m->state_, hop, cudaMemcpyDeviceToHost, Fm->cs);
             cudaEventRecord(m->spec_ev_hop_[out_sl], Fm->cs);
+            m->spec_span_end();
         }
     } else {
         cudaMemcpyAsync(hl->spec_hop_h_[sl], hl->state_, hop, cudaMemcpyDeviceToHost, hl->fast_->cs);
         cudaEventRecord(hl->spec_ev_hop_[sl], hl->fast_->cs);
     }
     lap(3);
+    spec_span_end();
     ++spec_n_;
     cudaSetDevice(dev_);
     if (sprof) {
@@ -7747,6 +7753,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
         t0 = t;
     };
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec tail sync", err)) return false;
+    spec_span_take();
     lap(0);
     if (F->prof_on) F->collect();
     if (!fast_boundary(err)) return false;
@@ -7769,6 +7776,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
     // running fast_mtp for ~1.8 ms, and enqueueing CUDA2 first lets CUDA2 run its layers simultaneously with CUDA3's
     // fast_mtp pass
     cudaStreamWaitEvent(F->cs, head->spec_ev_hop_[sl], 0);
+    spec_span_start();
     if (sprof) cudaEventRecord(spec_ev_[0], F->cs);
     cudaMemcpyAsync(state_, head->spec_hop_h_[sl], hop, cudaMemcpyHostToDevice, F->cs);
     if (!fast_layers(p, true, err)) return false;
@@ -7799,13 +7807,16 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
             cudaSetDevice(m->dev_);
             cudaMemcpyAsync(FA->hop_h, m->state_, hop, cudaMemcpyDeviceToHost, FA->cs);
             cudaEventRecord(FA->ev_hop, FA->cs);
+            m->spec_span_end();   // R20: this part's work for the position is done at its hop out
             cudaSetDevice(next->dev_);
             if (!glmfast::cuda_ok(cudaStreamSynchronize(FB->cs), "glm spec tail part sync", err) ||
                 !FB->route_ok(err)) return false;
+            next->spec_span_take();
             if (FB->prof_on) FB->collect();
             if (!next->fast_boundary(err)) return false;
             next->pos_ = p + 1;
             cudaStreamWaitEvent(FB->cs, FA->ev_hop, 0);
+            next->spec_span_start();
             cudaMemcpyAsync(next->state_, FA->hop_h, hop, cudaMemcpyHostToDevice, FB->cs);
             if (!next->fast_layers(p, true, err)) return false;
         }
@@ -7823,6 +7834,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
         }
         if (m->fast_->prof_on) m->fast_->mark("head_mv");
         enqueue_pick(m, FL);
+        m->spec_span_end();
         cudaSetDevice(dev_);
         return true;
     }
@@ -7837,6 +7849,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
     }
     if (F->prof_on) F->mark("head_mv");
     enqueue_pick(this, F);
+    spec_span_end();
     if (sprof) {
         cudaEventRecord(spec_ev_[1], F->cs);
         spec_ev_live_ = true;
@@ -7865,6 +7878,43 @@ void Glm5Model::spec_dev_take() {
     }
 }
 
+// R20: the per-card busy span and idle with NO synchronise anywhere (R19 s7a's prerequisite for the intra-group
+// pipelining).  Every spec_* entry point already begins with a cudaStreamSynchronize on its OWN stream, so a start
+// event recorded there executes immediately and carries "this device is idle, now"; the end event goes after the part's
+// last enqueue for that position.  Reading the pair back two positions later inserts no wait: that stream has been
+// synchronised twice in between.  R19's attempt put cudaEventSynchronize inside the host's enqueue loop and cost 50.7%.
+void Glm5Model::spec_span_start() {
+    if (getenv("MAYA_GLM_SPEC_GAP") == nullptr) return;
+    if (spec_per_ev_[0] == nullptr) {
+        for (auto& e : spec_per_ev_) cudaEventCreate(&e);
+        if (spec_per_ev_[0] == nullptr) return;
+    }
+    cudaSetDevice(dev_);
+    const int c = (int) (spec_per_n_ & 1);
+    cudaEventRecord(spec_per_ev_[2 * c], fast_->cs);
+    ++spec_per_n_;
+}
+
+void Glm5Model::spec_span_end() {
+    if (spec_per_ev_[0] == nullptr || spec_per_n_ == 0) return;
+    cudaSetDevice(dev_);
+    const int c = (int) ((spec_per_n_ - 1) & 1);
+    cudaEventRecord(spec_per_ev_[2 * c + 1], fast_->cs);
+}
+
+void Glm5Model::spec_span_take() {
+    if (spec_per_ev_[0] == nullptr || spec_per_n_ < 3) return;
+    cudaSetDevice(dev_);
+    const int c2 = (int) ((spec_per_n_ - 2) & 1);   // the span to read: position n-2 (its pair is still intact)
+    const int c1 = c2 ^ 1;                          // the next start: position n-1
+    float span = 0.0f, period = 0.0f;
+    cudaEventElapsedTime(&span, spec_per_ev_[2 * c2], spec_per_ev_[2 * c2 + 1]);
+    cudaEventElapsedTime(&period, spec_per_ev_[2 * c2], spec_per_ev_[2 * c1]);
+    spec_busy_ms_ += span;
+    spec_idle_ms_ += period - span;
+    ++spec_per_k_;
+}
+
 // hop_to_next in its two halves (the same calls in the same order): this part's residual into its pinned hop_h ...
 void Glm5Model::spec_hop_out(bool prof) {
     FastState* FA = fast_;
@@ -7883,6 +7933,7 @@ bool Glm5Model::spec_hop_in(Glm5Model* A, int64_t p, bool prof, std::string& err
     cudaSetDevice(dev_);
     pos_ = p + 1;
     cudaStreamWaitEvent(FB->cs, A->fast_->ev_hop, 0);
+    spec_span_start();
     if (prof) cudaEventRecord(spec_ev_[0], FB->cs);
     cudaMemcpyAsync(state_, A->fast_->hop_h, glmres::res_hop_bytes(g_), cudaMemcpyHostToDevice, FB->cs);   // glm-dsa B2.3
     return fast_layers(p, true, err);
@@ -7910,6 +7961,7 @@ bool Glm5Model::spec_tail_front(Glm5Model* head, int64_t p, std::string& err) {
         t0 = t;
     };
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec tail sync", err)) return false;
+    spec_span_take();
     lap(0);
     if (F->prof_on) F->collect();
     if (!fast_boundary(err)) return false;
@@ -7923,11 +7975,13 @@ bool Glm5Model::spec_tail_front(Glm5Model* head, int64_t p, std::string& err) {
         cudaSetDevice(m->dev_);
         if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm spec tail part sync", err) ||
             !m->fast_->route_ok(err) || !m->fast_boundary(err)) return false;
+        m->spec_span_take();
         m->pos_ = p + 1;
         if (sprof) m->spec_dev_take();
     }
     cudaSetDevice(dev_);
     cudaStreamWaitEvent(F->cs, head->spec_ev_hop_[sl], 0);
+    spec_span_start();
     if (sprof) cudaEventRecord(spec_ev_[0], F->cs);
     cudaMemcpyAsync(state_, head->spec_hop_h_[sl], glmres::res_hop_bytes(g), cudaMemcpyHostToDevice,
                     F->cs);   // glm-dsa B2.3
@@ -7938,6 +7992,7 @@ bool Glm5Model::spec_tail_front(Glm5Model* head, int64_t p, std::string& err) {
         if (!m->split_next_->spec_hop_in(m, p, sprof, err)) return false;
     }
     m->spec_hop_out(sprof);   // the last part's predecessor: back takes its residual in
+    m->spec_span_end();
     cudaSetDevice(dev_);
     return true;
 }
@@ -7955,6 +8010,7 @@ bool Glm5Model::spec_tail_back(Glm5Model* head, int64_t p, std::string& err) {
     cudaSetDevice(m->dev_);
     if (!glmfast::cuda_ok(cudaStreamSynchronize(FL->cs), "glm spec tail part sync", err) || !FL->route_ok(err) ||
         !m->fast_boundary(err)) return false;
+    m->spec_span_take();
     if (sprof) m->spec_dev_take();
     if (!m->spec_hop_in(prev, p, sprof, err)) return false;
     glmres::res_head(g, m->state_, m->w_.at("output_norm.weight"), FL->head_x, FL->head_xq, FL->cs);   // glm-dsa B2.3
@@ -7971,6 +8027,7 @@ bool Glm5Model::spec_tail_back(Glm5Model* head, int64_t p, std::string& err) {
     gf::argmax(m->sc_ + m->sc_logits, g.n_vocab, FL->tok, FL->cs);
     cudaMemcpyAsync(FL->tok_h, FL->tok, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
     cudaEventRecord(FL->ev_done, FL->cs);
+    m->spec_span_end();
     if (sprof) {
         cudaEventRecord(m->spec_ev_[1], FL->cs);
         m->spec_ev_live_ = true;
@@ -8372,7 +8429,17 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             else if (m->spec_dev_n_ > 0)   // glm-dsa B11.2: a tail part after the group's first (its device span)
                 std::fprintf(stderr, "glm spec prof CUDA%d (%lld tokens): DEVICE token %.2f ms (tail part)\n", m->dev_,
                              (long long) m->spec_dev_n_, m->spec_dev_ms_ / (double) m->spec_dev_n_);
+
     }
+    if (getenv("MAYA_GLM_SPEC_GAP") != nullptr)   // R20: the per-card span and idle, no synchronise in the instrument
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+            if (m->spec_per_k_ > 0)
+                std::fprintf(stderr,
+                             "glm spec gap CUDA%d (%lld positions): BUSY %.2f ms/token, IDLE %.2f ms/token, "
+                             "idle share %.1f%%\n",
+                             m->dev_, (long long) m->spec_per_k_, m->spec_busy_ms_ / (double) m->spec_per_k_,
+                             m->spec_idle_ms_ / (double) m->spec_per_k_,
+                             100.0 * m->spec_idle_ms_ / std::max(1e-9, m->spec_busy_ms_ + m->spec_idle_ms_));
     glmspec::report(this, false), glmspec::tune_end(produced);   // glm-dsa B11.2 / B11.3
     if (ok && !check()) ok = false;
     return ok;
