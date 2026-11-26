@@ -855,7 +855,7 @@ public:
     // hop_to_next in two halves, and a tail part's MAYA_GLM_SPEC_PROF device span
     bool spec_tail_front(Glm5Model* head, int64_t p, std::string& err);
     bool spec_tail_back(Glm5Model* head, int64_t p, std::string& err);
-    void spec_hop_out(bool prof);
+    void spec_hop_out(int64_t p, bool prof);
     bool spec_hop_in(Glm5Model* A, int64_t p, bool prof, std::string& err);
     void spec_dev_take();
     // ---- several conversations at once (src/core/glm_multi.cu, MAYA_GLM_SEQS=<n>): each part keeps n sequence

@@ -221,6 +221,17 @@ static int spec_hop_depth() {
     return d;
 }
 
+// R30: whether the hop ring covers the WHOLE chain (a tail group's inner hops too), not only the head group.
+// A tail part with a single pinned buffer overwrites the residual its successor may still be reading a position
+// earlier.  0 = the old single-slot tail path, for an in-binary A/B.
+static bool spec_hop_chain() {
+    static const bool on = [] {
+        const char* v = getenv("MAYA_GLM_SPEC_HOP_CHAIN");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 // The NUMA nodes this machine has (sysfs "online" list), and the most of this process's CPUs on any one of them;
 // {} / 0 when unknown or on a single node.
 static std::vector<int> numa_nodes() {
@@ -1257,7 +1268,16 @@ bool Glm5Model::fast_setup(std::string& err) {
     // would take them on its first decode step, when the pool holds all but the reserve and the reserve is not all
     // allocatable.  The head group is the parts [0, h) that kda_all walks; h comes from part_/n_parts_ because
     // split_next_ is linked only after every part has loaded.
-    if (!dflash_on_ && g_.nextn > 0 && n_parts_ > 1 && part_ < spec_head_parts(n_parts_, g_.arch == GlmArch::GlmDsa) &&
+    // R30: MAYA_GLM_SPEC_TAIL_PIPE=1 also takes it on the TAIL GROUP's first part - the one that may run a position
+    // ahead of the part after it (its input is the head's hop, not a confirmed token), so it needs its own copy to
+    // roll back to when that position's draft was wrong.  Off by default.
+    static const bool tail_pipe_rsv = [] {
+        const char* v = getenv("MAYA_GLM_SPEC_TAIL_PIPE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    const int spec_h_parts = spec_head_parts(n_parts_, g_.arch == GlmArch::GlmDsa);
+    if (!dflash_on_ && g_.nextn > 0 && n_parts_ > 1 &&
+        (part_ < spec_h_parts || (tail_pipe_rsv && part_ == spec_h_parts)) &&
         !strata::platform::env_switch("MAYA_GLM_NO_MTP") && !strata::platform::env_switch("MAYA_GLM_NO_SPEC") &&
         !spec_kda_reserve(err))
         return false;
@@ -7814,13 +7834,21 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
     if (split_next_) {
         // a tail GROUP: down its parts; the last one computes the head and the pick
         Glm5Model* m = this;
-        for (; m->split_next_; m = m->split_next_.get()) {
+        int hop_i = 0;
+        for (; m->split_next_; m = m->split_next_.get(), ++hop_i) {
             Glm5Model* next = m->split_next_.get();
             FastState* FA = m->fast_;
             FastState* FB = next->fast_;
+            // R30: the chain's hop through the ring (head group's scheme: an intermediate hop is keyed by the CALL,
+            // so a redo at the same position cannot overwrite a slot a later part still reads).  At depth 2 and a
+            // single intermediate hop this is the position parity, exactly what the single slot behaved as.
+            const bool hc = spec_hop_chain();
+            const int chs = hc ? (int) ((p + (int64_t) hop_i) % spec_hop_depth()) : -1;
+            float* chb = hc ? m->spec_hop_h_[chs] : FA->hop_h;
+            cudaEvent_t che = hc ? m->spec_ev_hop_[chs] : FA->ev_hop;
             cudaSetDevice(m->dev_);
-            cudaMemcpyAsync(FA->hop_h, m->state_, hop, cudaMemcpyDeviceToHost, FA->cs);
-            cudaEventRecord(FA->ev_hop, FA->cs);
+            cudaMemcpyAsync(chb, m->state_, hop, cudaMemcpyDeviceToHost, FA->cs);
+            cudaEventRecord(che, FA->cs);
             m->spec_span_end();   // R20: this part's work for the position is done at its hop out
             cudaSetDevice(next->dev_);
             if (!glmfast::cuda_ok(cudaStreamSynchronize(FB->cs), "glm spec tail part sync", err) ||
@@ -7829,9 +7857,9 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
             if (FB->prof_on) FB->collect();
             if (!next->fast_boundary(err)) return false;
             next->pos_ = p + 1;
-            cudaStreamWaitEvent(FB->cs, FA->ev_hop, 0);
+            cudaStreamWaitEvent(FB->cs, che, 0);
             next->spec_span_start();
-            cudaMemcpyAsync(next->state_, FA->hop_h, hop, cudaMemcpyHostToDevice, FB->cs);
+            cudaMemcpyAsync(next->state_, chb, hop, cudaMemcpyHostToDevice, FB->cs);
             if (!next->fast_layers(p, true, err)) return false;
         }
         cudaSetDevice(m->dev_);
@@ -7930,11 +7958,17 @@ void Glm5Model::spec_span_take() {
 }
 
 // hop_to_next in its two halves (the same calls in the same order): this part's residual into its pinned hop_h ...
-void Glm5Model::spec_hop_out(bool prof) {
+void Glm5Model::spec_hop_out(int64_t p, bool prof) {
     FastState* FA = fast_;
     cudaSetDevice(dev_);
-    cudaMemcpyAsync(FA->hop_h, state_, glmres::res_hop_bytes(g_), cudaMemcpyDeviceToHost, FA->cs);   // glm-dsa B2.3
-    cudaEventRecord(FA->ev_hop, FA->cs);
+    // R30: the chain's hop goes through the ring, keyed by the position (a redo at the same position re-recorded the
+    // same slot's event: the waiter takes the latest record).  MAYA_GLM_SPEC_HOP_CHAIN=0 keeps the single buffer.
+    const bool hc = spec_hop_chain();
+    const int cs = (int) (p % spec_hop_depth());
+    float* buf = hc ? spec_hop_h_[cs] : FA->hop_h;
+    cudaEvent_t ev = hc ? spec_ev_hop_[cs] : FA->ev_hop;
+    cudaMemcpyAsync(buf, state_, glmres::res_hop_bytes(g_), cudaMemcpyDeviceToHost, FA->cs);   // glm-dsa B2.3
+    cudaEventRecord(ev, FA->cs);
     if (prof) {
         cudaEventRecord(spec_ev_[1], FA->cs);
         spec_ev_live_ = true;
@@ -7946,10 +7980,14 @@ bool Glm5Model::spec_hop_in(Glm5Model* A, int64_t p, bool prof, std::string& err
     FastState* FB = fast_;
     cudaSetDevice(dev_);
     pos_ = p + 1;
-    cudaStreamWaitEvent(FB->cs, A->fast_->ev_hop, 0);
+    const bool hc = spec_hop_chain();
+    const int cs = (int) (p % spec_hop_depth());
+    cudaEvent_t ev = hc ? A->spec_ev_hop_[cs] : A->fast_->ev_hop;
+    float* buf = hc ? A->spec_hop_h_[cs] : A->fast_->hop_h;
+    cudaStreamWaitEvent(FB->cs, ev, 0);
     spec_span_start();
     if (prof) cudaEventRecord(spec_ev_[0], FB->cs);
-    cudaMemcpyAsync(state_, A->fast_->hop_h, glmres::res_hop_bytes(g_), cudaMemcpyHostToDevice, FB->cs);   // glm-dsa B2.3
+    cudaMemcpyAsync(state_, buf, glmres::res_hop_bytes(g_), cudaMemcpyHostToDevice, FB->cs);   // glm-dsa B2.3
     return fast_layers(p, true, err);
 }
 
@@ -8002,10 +8040,10 @@ bool Glm5Model::spec_tail_front(Glm5Model* head, int64_t p, std::string& err) {
     if (!fast_layers(p, true, err)) return false;
     Glm5Model* m = this;
     for (; m->split_next_.get() != last; m = m->split_next_.get()) {
-        m->spec_hop_out(sprof);
+        m->spec_hop_out(p, sprof);
         if (!m->split_next_->spec_hop_in(m, p, sprof, err)) return false;
     }
-    m->spec_hop_out(sprof);   // the last part's predecessor: back takes its residual in
+    m->spec_hop_out(p, sprof);   // the last part's predecessor: back takes its residual in
     m->spec_span_end();
     cudaSetDevice(dev_);
     return true;
@@ -8097,7 +8135,13 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         std::fprintf(stderr, "%s - MAYA_GLM_STALL_S=0 turns this line off\n", line.c_str());
     });
     const Glm5Geometry& g = g_;
-    for (Glm5Model* m = this; m != hl->split_next_.get(); m = m->split_next_.get()) {
+    // R30: the ring covers the WHOLE chain, not just the head group.  A tail group's parts hand the residual over
+    // through FastState::hop_h, one pinned buffer per part: with a single slot a part that runs position p+1
+    // overwrites the residual its successor may still be reading at p.  The head group already had this ring; the
+    // tail group needs it for the same reason once its first part may run a position ahead of its last.
+    // MAYA_GLM_SPEC_HOP_CHAIN=0 keeps the old single-slot tail path (an in-binary A/B).
+    const bool hop_chain = spec_hop_chain();
+    for (Glm5Model* m = this; m != (hop_chain ? nullptr : hl->split_next_.get()); m = m->split_next_.get()) {
         if (m->spec_hop_h_[0] == nullptr) {
             cudaSetDevice(m->dev_);
             for (int i = 0; i < kSpecHopMax; ++i)
@@ -8185,6 +8229,22 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     // the draft vocabulary (#795) stay with the splits of three GPUs or more they were measured on: since they came,
     // a two-GPU split (RTX PRO 5000 + RTX 4090, Windows) decoded at 0.1 tok/s and then failed with an illegal memory
     // access, where v1.1.51 and MAYA_GLM_NO_SPEC=1 did not.
+    // R30: the tail group's first part (CUDA2) may run position q+2 while the last part (CUDA3) is still at q+1:
+    // its input is the head's hop, and the head stands a position ahead on a draft, so CUDA2 needs no confirmed
+    // token - only a recurrent-state backup to roll back to when that draft is wrong.  MAYA_GLM_SPEC_TAIL_PIPE=1
+    // (default OFF).  spec_tail_front / spec_tail_back are spec_tail split at the hop, so together they are its
+    // exact equivalent; only the host's turn between the two devices moves.
+    static const bool tail_pipe = [] {
+        const char* v = getenv("MAYA_GLM_SPEC_TAIL_PIPE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    const auto tail_kda = [&](bool restore) -> bool {
+        if (!tail_pipe) return true;
+        cudaSetDevice(B->dev_);
+        const bool ok2 = B->spec_kda_copy(restore);
+        cudaSetDevice(dev_);
+        return ok2;
+    };
     const bool v51 = n_parts_ == 2;
     const bool tail_samples = !v51 && !sp.greedy && sp.penalty_last_n <= 0;
     const bool sample_hook = tail_samples || spec_sample;   // (3+ GPUs: tail_samples - spec_sample is one of them)
@@ -8311,6 +8371,15 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         // (1) the tail's token for position q+1 -> y (the truth for position q+2)
         int y2 = -1;
         lap(5);
+        // R30: CUDA2 takes q+2 now, off the head's speculative hop for q+2, while CUDA3 is still finishing q+1
+        // (take() below waits for exactly that).  Its recurrent states are saved first so a wrong draft can be
+        // rolled back and the position run again with the corrected hop.
+        const bool fronted = tail_pipe && !v51 && q + 3 < max_ctx_;
+        if (fronted) {
+            if (!tail_kda(false)) { err = "glm spec: the tail's backup"; ok = false; break; }
+            stall.phase("the tail's front");
+            if (!B->spec_tail_front(hl, q + 2, err)) { ok = false; break; }
+        }
         stall.step("the tail's token");
         if (!take(y2)) { ok = false; break; }
         lapn(0, early ? 2 : 1);
@@ -8371,8 +8440,14 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
                 } else {
                     kda_all(true);
                 }
+                // R30: the tail's first part ran q+2 off the WRONG draft's hop, so its recurrent states go back and
+                // it runs q+2 again - after the head's redo, so the hop it waits on is the corrected one.
+                if (fronted) {
+                    if (!tail_kda(true)) { err = "glm spec: the tail's restore"; ok = false; break; }
+                }
                 stall.phase("the head's redo");
                 if (!spec_head(q + 2, y2, err)) { ok = false; break; }
+                if (fronted && !B->spec_tail_front(hl, q + 2, err)) { ok = false; break; }
                 lap(2);
             }
             // (2) the draft for q+3 from (h_{q+1}, y2) is enqueued BEFORE the tail's q+2 pass: the drafter reads the
@@ -8382,9 +8457,10 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             cudaSetDevice(TL->dev_);
             if (!TL->fast_mtp(dp, y2, err)) { ok = false; break; }
             // (4) the tail's next position goes in first: it waits for the head's hop on the device and starts its
-            //     layers while the host waits for the draft (and the head group's next enqueue)
+            //     layers while the host waits for the draft (and the head group's next enqueue).
+            //     R30: with the front already standing (CUDA2 at q+2), only the last part is left - spec_tail_back.
             stall.phase("the tail's next position");
-            if (!B->spec_tail(hl, q + 2, err)) { ok = false; break; }
+            if (fronted ? !B->spec_tail_back(hl, q + 2, err) : !B->spec_tail(hl, q + 2, err)) { ok = false; break; }
             lap(3);
             kda_all(false);
             if (cancel) fast_->spec_cancellable = true;   // q+3 with the new draft: speculative
