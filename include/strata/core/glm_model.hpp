@@ -789,8 +789,12 @@ public:
     float* kda_bak_ = nullptr;                             // the head's saved recurrent states
     bool kda_bak_cur_ = false;   // win_commit_part left kda_bak_ equal to the live states (the next pipelined begin's
                                  // backup is not needed)
-    float* spec_hop_h_[2] = {nullptr, nullptr};            // pinned hop slots by position parity
-    cudaEvent_t spec_ev_hop_[2] = {nullptr, nullptr};
+    // R25: the hop slots, kSpecHopMax of them, addressed modulo the depth in use (spec_hop_depth(): MAYA_GLM_SPEC_HOP,
+    // default 2 = the position parity as before).  A deeper ring keeps a slot from being overwritten while a later part
+    // still reads it, which is what lets a group's parts work on different positions.
+    static constexpr int kSpecHopMax = 8;
+    float* spec_hop_h_[kSpecHopMax] = {};                  // pinned hop slots, by position (modulo the depth)
+    cudaEvent_t spec_ev_hop_[kSpecHopMax] = {};
     bool spec_kda_copy(bool restore);
     size_t spec_kda_bytes() const;                         // the head's saved recurrent states on this part
     bool spec_kda_reserve(std::string& err);               // ... taken at setup, before the expert pool

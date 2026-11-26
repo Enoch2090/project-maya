@@ -208,6 +208,19 @@ static int spec_head_parts(int n, bool dsa) {
     return std::max(1, std::min(n - 1, h));
 }
 
+// R25: how many hop slots the spec path's rings use (MAYA_GLM_SPEC_HOP, default 2 = the position parity the two-slot
+// code used).  A deeper ring is what lets a group's later part still be reading position p while the earlier part
+// writes p+1; with two slots any part more than one position behind is overwritten.  Read once; clamped to
+// [2, kSpecHopMax] so the parity default and every intermediate depth are reachable without a recompile.
+static int spec_hop_depth() {
+    static const int d = [] {
+        const char* v = getenv("MAYA_GLM_SPEC_HOP");
+        const int n = v != nullptr ? std::atoi(v) : 2;
+        return std::max(2, std::min(Glm5Model::kSpecHopMax, n));
+    }();
+    return d;
+}
+
 // The NUMA nodes this machine has (sysfs "online" list), and the most of this process's CPUs on any one of them;
 // {} / 0 when unknown or on a single node.
 static std::vector<int> numa_nodes() {
@@ -4759,7 +4772,7 @@ void Glm5Model::fast_destroy() {
         cudaFree(kda_bak_);
         kda_bak_ = nullptr;
     }
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < kSpecHopMax; ++i) {
         if (spec_hop_h_[i]) cudaFreeHost(spec_hop_h_[i]);
         if (spec_ev_hop_[i]) cudaEventDestroy(spec_ev_hop_[i]);
         spec_hop_h_[i] = nullptr;
@@ -7696,8 +7709,9 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     }
     if (!layers_ok) return false;
     const size_t hop = (size_t) g.hc * g.n_embd * sizeof(float);
-    const int hsl = (int) (spec_n_ & 1);
-    const int sl = (int) (p & 1);
+    const int hopd = spec_hop_depth();
+    const int hsl = (int) (spec_n_ % hopd);
+    const int sl = (int) (p % hopd);
     if (this != hl) {
         // hand off to the next head part through this part's double-buffered hop slot hsl (alternates every spec_head
         // call, including redos at the same p, so CUDA0's next call never overwrites the slot CUDA1 is still reading)
@@ -7760,7 +7774,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
     lap(1);
     ++spec_n_;
     pos_ = p + 1;
-    const int sl = (int) (p & 1);
+    const int sl = (int) (p % spec_hop_depth());
     const size_t hop = (size_t) g.hc * g.n_embd * sizeof(float);
     if (sprof) {
         if (spec_ev_[0] == nullptr)
@@ -7968,7 +7982,7 @@ bool Glm5Model::spec_tail_front(Glm5Model* head, int64_t p, std::string& err) {
     lap(1);
     ++spec_n_;
     pos_ = p + 1;
-    const int sl = (int) (p & 1);
+    const int sl = (int) (p % spec_hop_depth());
     if (sprof) spec_dev_take();
     Glm5Model* last = spec_tail_last();
     for (Glm5Model* m = split_next_.get(); m != last; m = m->split_next_.get()) {   // the parts in between
@@ -8086,7 +8100,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     for (Glm5Model* m = this; m != hl->split_next_.get(); m = m->split_next_.get()) {
         if (m->spec_hop_h_[0] == nullptr) {
             cudaSetDevice(m->dev_);
-            for (int i = 0; i < 2; ++i)
+            for (int i = 0; i < kSpecHopMax; ++i)
                 if (cudaHostAlloc((void**) &m->spec_hop_h_[i], (size_t) g.hc * g.n_embd * sizeof(float),
                                   cudaHostAllocPortable) != cudaSuccess ||
                     cudaEventCreateWithFlags(&m->spec_ev_hop_[i], cudaEventDisableTiming) != cudaSuccess) {
