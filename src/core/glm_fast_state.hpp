@@ -555,6 +555,117 @@ struct Glm5Model::FastState {
     int* tok_at(int64_t p) { const int i = head_ring_slot(p); return i == 0 ? tok : tok_r[i]; }
     int* tok_h_at(int64_t p) { const int i = head_ring_slot(p); return i == 0 ? tok_h : tok_h_r[i]; }
     cudaEvent_t ev_done_at(int64_t p) { const int i = head_ring_slot(p); return i == 0 ? ev_done : ev_done_r[i]; }
+    // ---- R49: the layer body's own scratch, one ring slot per position (MAYA_GLM_SPEC_SCR_RING=<depth>, default 1 =
+    // off).  A part still running position p must not have these overwritten by the enqueue of p+1 - the entry sync in
+    // spec_head used to guarantee that by waiting for the whole position (R48 measured 13.3 ms of a 14.0 ms call in
+    // that wait).  fast_layers binds its position's slot at entry (ScrBind), and because every consumer inside the body
+    // and in its callees (fast_dsa, fast_moe, the window replay) reads these plain pointers, binding them covers exactly
+    // the body's call subtree - that is the consumer list R39 kept by hand, and by hand it lost two sites.
+    // SLOT 0 IS ALWAYS the plain arena buffers (the bind leaves them in place), so depth 1 is exactly the single buffers
+    // of before and a slot-0 access can never be null.  Slot `scr_depth` is the draft block's own (fast_mtp writes x /
+    // xq / mixer / ffn / rlog / sh_* / hq as its scratch): positions use 0..scr_depth-1 only, so the block cannot
+    // collide with a position even on its own stream (MAYA_GLM_MTP_STREAM=1).
+    // NOT ringed, with the reason: part / pre / post / comb / counter (a layer's own, consumed inside that layer), the
+    // DSA selection buffers (cells / slot_cells / score / q / iq / qr_raw / kv_raw / ik_raw / ig_raw / iw / attn_q) and
+    // gated_q, and everything prefill uses (glm_rows / glm_window / glm_residual) - none of those is read across a
+    // position boundary inside a part, and a part's positions queue on ONE stream, so two of them cannot overlap.
+    static constexpr int kScrMax = 8;
+    int scr_depth = 1;
+    float* x_r[kScrMax] = {};
+    void* xq_r[kScrMax] = {};
+    float* mixer_r[kScrMax] = {};
+    float* ffn_r[kScrMax] = {};
+    float* conv_r[kScrMax][3] = {};
+    float* proj_r[kScrMax][3] = {};
+    float* fa_r[kScrMax] = {};
+    float* ga_r[kScrMax] = {};
+    float* beta_r[kScrMax] = {};
+    float* g1_r[kScrMax] = {};
+    float* g2_r[kScrMax] = {};
+    float* dg_r[kScrMax] = {};
+    float* du_r[kScrMax] = {};
+    void* dhq_r[kScrMax] = {};
+    void* hq_r[kScrMax] = {};
+    void* sh_hq_r[kScrMax] = {};
+    float* rlog_r[kScrMax] = {};
+    float* sh_g_r[kScrMax] = {};
+    float* sh_u_r[kScrMax] = {};
+    float* sh_out_r[kScrMax] = {};
+    float* emb_h_r[kScrMax] = {};   // pinned: this position's embedding row (spec_head's copy-out staging)
+    float* emb_h_at(int64_t p) { const int i = scr_slot(p); return i == 0 ? emb_h : emb_h_r[i]; }
+    int scr_slot(int64_t p) const {
+        if (scr_depth <= 1) return 0;
+        static const int fix = [] {
+            const char* v = getenv("MAYA_GLM_SPEC_SCR_FIX");   // (debug: one slot for every position)
+            return v != nullptr ? std::atoi(v) : -1;
+        }();
+        if (fix >= 0) return fix < scr_depth ? fix : 0;
+        return (int) (((p % scr_depth) + scr_depth) % scr_depth);
+    }
+    // The bind: swap one slot's pointers in for the duration of a layer-body call, put the plain ones back after.
+    // slot <= 0 (or depth 1) leaves the plain arena buffers alone.  Not reentrant across positions - a part's body runs
+    // on one host thread, and nothing inside a body starts another position.
+    struct ScrBind {
+        FastState* F;
+        float *x, *mixer, *ffn, *fa, *ga, *beta, *g1, *g2, *sh_out, *sh_g, *sh_u, *rlog, *dg, *du;
+        float *proj0, *proj1, *proj2, *conv0, *conv1, *conv2;
+        void *xq, *hq, *dhq, *sh_hq;
+        ScrBind(FastState* f, int slot)
+            : F(f), x(f->x), mixer(f->mixer), ffn(f->ffn), fa(f->fa), ga(f->ga), beta(f->beta), g1(f->g1),
+              g2(f->g2), sh_out(f->sh_out), sh_g(f->sh_g), sh_u(f->sh_u), rlog(f->rlog), dg(f->dg), du(f->du),
+              proj0(f->proj[0]), proj1(f->proj[1]), proj2(f->proj[2]), conv0(f->conv[0]), conv1(f->conv[1]),
+              conv2(f->conv[2]), xq(f->xq), hq(f->hq), dhq(f->dhq), sh_hq(f->sh_hq) {
+            if (slot <= 0 || f->scr_depth <= 1 || slot >= kScrMax) return;
+            f->x = f->x_r[slot];
+            f->xq = f->xq_r[slot];
+            f->mixer = f->mixer_r[slot];
+            f->ffn = f->ffn_r[slot];
+            for (int i = 0; i < 3; ++i) {
+                f->conv[i] = f->conv_r[slot][i];
+                f->proj[i] = f->proj_r[slot][i];
+            }
+            f->fa = f->fa_r[slot];
+            f->ga = f->ga_r[slot];
+            f->beta = f->beta_r[slot];
+            f->g1 = f->g1_r[slot];
+            f->g2 = f->g2_r[slot];
+            f->dg = f->dg_r[slot];
+            f->du = f->du_r[slot];
+            f->dhq = f->dhq_r[slot];
+            f->hq = f->hq_r[slot];
+            f->sh_hq = f->sh_hq_r[slot];
+            f->rlog = f->rlog_r[slot];
+            f->sh_g = f->sh_g_r[slot];
+            f->sh_u = f->sh_u_r[slot];
+            f->sh_out = f->sh_out_r[slot];
+        }
+        ~ScrBind() {
+            F->x = x;
+            F->xq = xq;
+            F->mixer = mixer;
+            F->ffn = ffn;
+            for (int i = 0; i < 3; ++i) {
+                F->conv[i] = i == 0 ? conv0 : i == 1 ? conv1 : conv2;
+                F->proj[i] = i == 0 ? proj0 : i == 1 ? proj1 : proj2;
+            }
+            F->fa = fa;
+            F->ga = ga;
+            F->beta = beta;
+            F->g1 = g1;
+            F->g2 = g2;
+            F->dg = dg;
+            F->du = du;
+            F->dhq = dhq;
+            F->hq = hq;
+            F->sh_hq = sh_hq;
+            F->rlog = rlog;
+            F->sh_g = sh_g;
+            F->sh_u = sh_u;
+            F->sh_out = sh_out;
+        }
+        ScrBind(const ScrBind&) = delete;
+        ScrBind& operator=(const ScrBind&) = delete;
+    };
     // R44 (MAYA_GLM_HEAD_MERGE): the draft block's head as the trunk's head launch's SECOND column, so one pass over
     // output.weight serves both.  mtp_hxq_pair holds the trunk's q8_1 input and the block's, one xq stride apart;
     // mtp_hx_pair their two logits buffers, one vocabulary apart.  fast_mtp fills the block's side and returns, the

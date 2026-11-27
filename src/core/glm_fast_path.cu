@@ -232,6 +232,21 @@ static bool d2_rounds() {
     return on;
 }
 
+// R49 (MAYA_GLM_SPEC_PIPE=1): the head group stops waiting for its own stream at each position's entry.  With the layer
+// body's scratch ring (MAYA_GLM_SPEC_SCR_RING>=2) the two positions of a two-position round can be enqueued back to back
+// without one overwriting what the other is still reading, so the 13.3 ms a spec_head call spent waiting for the
+// previous position (R48) goes away.  The boundary rewrites the expert placement tables and needs a stream that is not
+// running a position, so under this switch a boundary whose stream is busy is SKIPPED (the migration catches up on the
+// next position that finds its stream idle) instead of waited for: that is the whole point - waiting for it is the
+// barrier.  MAYA_GLM_SPEC_BOUNDARY_N still gates how often a boundary is looked at.
+static bool spec_pipe() {
+    static const bool on = [] {
+        const char* v = getenv("MAYA_GLM_SPEC_PIPE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 // R30: whether the hop ring covers the WHOLE chain (a tail group's inner hops too), not only the head group.
 // A tail part with a single pinned buffer overwrites the residual its successor may still be reading a position
 // earlier.  0 = the old single-slot tail path, for an in-binary A/B.
@@ -1204,6 +1219,55 @@ bool Glm5Model::fast_setup(std::string& err) {
             std::fprintf(stderr, "glm spec: the output head's ring, %d slots (%lld MB)\n", ring_depth,
                          (long long) ((size_t) (ring_depth - 1) *
                                       ((size_t) E * sizeof(float) * 2 + (size_t) g.n_vocab * sizeof(float)) / 1048576));
+    }
+    // R49: MAYA_GLM_SPEC_SCR_RING=<depth> (default 1 = off) - the layer body's own scratch, one slot per position.
+    // Slot 0 is the arena's plain buffers (the bind leaves them alone); slots 1..depth are new memory here, and slot
+    // `depth` is kept for the draft block (fast_mtp is not a position, so it must not land on a position's slot).
+    {
+        static const int scr_depth = [] {
+            const char* v = getenv("MAYA_GLM_SPEC_SCR_RING");
+            const int n = v != nullptr ? std::atoi(v) : 1;
+            return std::max(1, std::min(FastState::kScrMax - 1, n));
+        }();
+        F->scr_depth = scr_depth;
+        static const int alloc_n = [] {   // (debug/env: the same memory for two arms that differ only in slot choice)
+            const char* v = getenv("MAYA_GLM_SPEC_SCR_ALLOC");
+            return v != nullptr ? std::max(0, std::min(FastState::kScrMax - 1, std::atoi(v))) : -1;
+        }();
+        const int n_slots = alloc_n >= 0 ? alloc_n : (scr_depth > 1 ? scr_depth : 0);
+        const size_t fl = sizeof(float);
+        size_t extra = 0;
+        for (int i = 1; i <= n_slots; ++i) {
+            const auto al = [&](void** dst, size_t bytes) {
+                extra += bytes;
+                return cudaMalloc(dst, bytes) == cudaSuccess;
+            };
+            const bool fine =
+                al((void**) &F->x_r[i], (size_t) E * fl) && al(&F->xq_r[i], (size_t) E / 32 * q8) &&
+                al((void**) &F->mixer_r[i], (size_t) E * fl) && al((void**) &F->ffn_r[i], (size_t) E * fl) &&
+                al((void**) &F->conv_r[i][0], (size_t) DI * fl) && al((void**) &F->conv_r[i][1], (size_t) DI * fl) &&
+                al((void**) &F->conv_r[i][2], (size_t) DI * fl) && al((void**) &F->proj_r[i][0], (size_t) DI * fl) &&
+                al((void**) &F->proj_r[i][1], (size_t) DI * fl) && al((void**) &F->proj_r[i][2], (size_t) DI * fl) &&
+                al((void**) &F->fa_r[i], (size_t) g.kda_head_dim * fl) &&
+                al((void**) &F->ga_r[i], (size_t) g.kda_head_dim * fl) &&
+                al((void**) &F->beta_r[i], (size_t) g.n_head * fl) && al((void**) &F->g1_r[i], (size_t) DI * fl) &&
+                al((void**) &F->g2_r[i], (size_t) DI * fl) &&
+                al((void**) &F->dg_r[i], (size_t) g.n_ff_dense * fl) &&
+                al((void**) &F->du_r[i], (size_t) g.n_ff_dense * fl) &&
+                al(&F->dhq_r[i], (size_t) g.n_ff_dense / 32 * q8) && al(&F->hq_r[i], (size_t) 8 * g.n_ff_exp / 32 * q8) &&
+                al(&F->sh_hq_r[i], (size_t) FF / 32 * q8) && al((void**) &F->rlog_r[i], (size_t) g.n_expert * fl) &&
+                al((void**) &F->sh_g_r[i], (size_t) FF * fl) && al((void**) &F->sh_u_r[i], (size_t) FF * fl) &&
+                al((void**) &F->sh_out_r[i], (size_t) E * fl) &&
+                cudaHostAlloc((void**) &F->emb_h_r[i], (size_t) E * fl, cudaHostAllocDefault) == cudaSuccess;
+            if (!fine) {
+                err = "glm fast: the layer body's scratch ring did not allocate";
+                return false;
+            }
+        }
+        if (n_slots > 0)
+            std::fprintf(stderr, "glm spec: the layer body's scratch ring, %d slots allocated (%lld MB); %d in use: "
+                                 "positions 0..%d, the draft %d\n",
+                         n_slots, (long long) (extra / 1048576), scr_depth, scr_depth - 1, scr_depth);
     }
     if (mtp_il_ >= 0) {
         if (cudaMalloc(&F->mtp_h, (size_t) g.n_embd * sizeof(float)) != cudaSuccess ||
@@ -4926,6 +4990,31 @@ void Glm5Model::fast_destroy() {
     if (F->pool) cudaFree(F->pool);
     for (uint8_t* p : F->pool_more) cudaFree(p);
     if (F->xpool) cudaFree(F->xpool);
+    for (int i = 1; i < FastState::kScrMax; ++i) {
+        if (F->x_r[i] != nullptr) cudaFree(F->x_r[i]);
+        if (F->xq_r[i] != nullptr) cudaFree(F->xq_r[i]);
+        if (F->mixer_r[i] != nullptr) cudaFree(F->mixer_r[i]);
+        if (F->ffn_r[i] != nullptr) cudaFree(F->ffn_r[i]);
+        for (int c = 0; c < 3; ++c) {
+            if (F->conv_r[i][c] != nullptr) cudaFree(F->conv_r[i][c]);
+            if (F->proj_r[i][c] != nullptr) cudaFree(F->proj_r[i][c]);
+        }
+        if (F->fa_r[i] != nullptr) cudaFree(F->fa_r[i]);
+        if (F->ga_r[i] != nullptr) cudaFree(F->ga_r[i]);
+        if (F->beta_r[i] != nullptr) cudaFree(F->beta_r[i]);
+        if (F->g1_r[i] != nullptr) cudaFree(F->g1_r[i]);
+        if (F->g2_r[i] != nullptr) cudaFree(F->g2_r[i]);
+        if (F->dg_r[i] != nullptr) cudaFree(F->dg_r[i]);
+        if (F->du_r[i] != nullptr) cudaFree(F->du_r[i]);
+        if (F->dhq_r[i] != nullptr) cudaFree(F->dhq_r[i]);
+        if (F->hq_r[i] != nullptr) cudaFree(F->hq_r[i]);
+        if (F->sh_hq_r[i] != nullptr) cudaFree(F->sh_hq_r[i]);
+        if (F->rlog_r[i] != nullptr) cudaFree(F->rlog_r[i]);
+        if (F->sh_g_r[i] != nullptr) cudaFree(F->sh_g_r[i]);
+        if (F->sh_u_r[i] != nullptr) cudaFree(F->sh_u_r[i]);
+        if (F->sh_out_r[i] != nullptr) cudaFree(F->sh_out_r[i]);
+        if (F->emb_h_r[i] != nullptr) cudaFreeHost(F->emb_h_r[i]);
+    }
     for (int i = 1; i < FastState::kHeadMax; ++i) {
         if (F->head_x_r[i] != nullptr) cudaFree(F->head_x_r[i]);
         if (F->head_xq_r[i] != nullptr) cudaFree(F->head_xq_r[i]);
@@ -6827,6 +6916,10 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     if (!g_.mhc()) return fast_layers_plain(p, hop_in, err);   // glm-dsa B2.3: plain residual (glm_residual.cu)
     (void) hop_in;
     FastState* F = fast_;
+    // R49: this position's scratch slot.  Everything the body enqueues - and everything its callees (fast_dsa,
+    // fast_moe, the window replay) read - goes through the plain pointers this swaps, so the slot follows the whole
+    // call subtree.  depth 1 (or slot 0) leaves the plain arena buffers in place, i.e. the behaviour before the ring.
+    const FastState::ScrBind scr_bind(F, F->scr_slot(p));
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
@@ -7183,6 +7276,10 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
         err = "glm mtp: no draft block on this half";
         return false;
     }
+    // R49: the draft block writes x / xq / mixer / ffn / rlog / sh_* / hq exactly as a position's body does, so it
+    // takes the slot after the position slots (scr_depth): a position enqueued behind it can never share one, even when
+    // the draft has a stream of its own (MAYA_GLM_MTP_STREAM=1).
+    const FastState::ScrBind scr_bind(F, F->scr_depth);
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd;
     static const bool full_head = [] {
@@ -7823,8 +7920,23 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     // draft, CUDA0 finishes the redo q+2 ~8 ms before CUDA1 finishes q+2, so CUDA0 can start q+3 immediately in
     // parallel with CUDA1's q+2 pass using double-buffered hop slot hsl = spec_n_ & 1
     const bool bnd_h = spec_bnd_due();   // R41: every n positions only (MAYA_GLM_SPEC_BOUNDARY_N)
-    if (bnd_h ? (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec head sync", err) || !F->route_ok(err))
-              : !F->route_ok(err)) return false;
+    bool bnd_run = bnd_h;
+    if (spec_pipe()) {
+        // R49: no wait for the previous position of this part.  Its scratch is in another ring slot, and the stream
+        // keeps the two positions in order anyway; only the boundary needs an idle stream, so it runs when the stream
+        // happens to be idle and is skipped otherwise.
+        if (!F->route_ok(err)) return false;
+        const cudaError_t q = cudaStreamQuery(F->cs);
+        if (q == cudaErrorNotReady) {
+            (void) cudaGetLastError();
+            bnd_run = false;
+        } else if (!glmfast::cuda_ok(q, "glm spec head query", err)) {
+            return false;
+        }
+    } else if (bnd_h ? (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec head sync", err) || !F->route_ok(err))
+                     : !F->route_ok(err)) {
+        return false;
+    }
     spec_span_take();    // R20: the span and idle of two positions ago (no wait: this stream is idle now)
     spec_span_start();   // ... and this position begins
     // MAYA_GLM_SPEC_CANCEL: a speculative pass (decode_spec says so) reads the live word before every layer; it is
@@ -7856,13 +7968,16 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
         cudaEventRecord(spec_ev_[0], F->cs);
     }
     if (F->prof_on) F->collect();
-    if (bnd_h && !fast_boundary(err)) return false;
+    if (bnd_run && !fast_boundary(err)) return false;
     lap(1);
+    // R49: position p's own pinned staging row - with the entry sync gone, p+1 staging into the same row could happen
+    // while p's copy out of it was still queued
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
-    tt->to_float(pack_emb_src_ + (size_t) token * ggml_row_size((ggml_type) pack_emb_type_, g.n_embd), F->emb_h,
+    float* emb_stage = F->emb_h_at(p);   // slot 0 aliases the plain pinned row (emb_h_r[0] is null by design)
+    tt->to_float(pack_emb_src_ + (size_t) token * ggml_row_size((ggml_type) pack_emb_type_, g.n_embd), emb_stage,
                  g.n_embd);
-    if (const float* img = image_row(p)) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
-    cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
+    if (const float* img = image_row(p)) std::memcpy(emb_stage, img, (size_t) g.n_embd * sizeof(float));   // an image
+    cudaMemcpyAsync(F->emb, emb_stage, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
     glmres::res_embed(g, F->emb, state_, F->cs);   // glm-dsa B2.3
     lap(2);
     if (cancellable) {
@@ -7889,11 +8004,24 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
              prev = m, m = m->split_next_.get()) {
             FastState* Fm = m->fast_;
             cudaSetDevice(m->dev_);
-            if (!glmfast::cuda_ok(cudaStreamSynchronize(Fm->cs), "glm spec head part sync", err) ||
-                !Fm->route_ok(err)) return false;
+            bool run_bnd = true;
+            if (spec_pipe()) {
+                // R49: same as the first part - no wait, and the boundary only on an idle stream
+                if (!Fm->route_ok(err)) return false;
+                const cudaError_t q = cudaStreamQuery(Fm->cs);
+                if (q == cudaErrorNotReady) {
+                    (void) cudaGetLastError();
+                    run_bnd = false;
+                } else if (!glmfast::cuda_ok(q, "glm spec head part query", err)) {
+                    return false;
+                }
+            } else if (!glmfast::cuda_ok(cudaStreamSynchronize(Fm->cs), "glm spec head part sync", err) ||
+                       !Fm->route_ok(err)) {
+                return false;
+            }
             m->spec_span_take();
             if (Fm->prof_on) Fm->collect();
-            if (!m->fast_boundary(err)) return false;
+            if (run_bnd && !m->fast_boundary(err)) return false;
             m->pos_ = p + 1;
             cudaStreamWaitEvent(Fm->cs, prev->spec_ev_hop_[hsl], 0);
             m->spec_span_start();   // after the wait: the wait for the predecessor is idle, not work
