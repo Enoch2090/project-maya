@@ -36,10 +36,22 @@ namespace strata::core {
 
 namespace {
 
+// R39: the carrier row, one slot per position (MAYA_GLM_SPEC_HEAD_RING=<depth>, default 1 = the single row).
+// Slot 0 IS `row`, so depth 1 is exactly the old behaviour.  `st.pos` stays "the last position noted" (what
+// snapshot_save compares against n - 1); which SLOT holds it is pos_r[].
 struct DevCarrier {
     glmmtp::CarrierState st;
     float* row = nullptr;
     float* snap = nullptr;
+    static constexpr int kMax = 8;
+    float* row_r[kMax] = {};
+    int64_t pos_r[kMax] = {};
+    int depth = 1;
+    int slot(int64_t p) const {
+        if (depth <= 1) return 0;
+        return (int) (((p % depth) + depth) % depth);
+    }
+    float* at(int64_t p) { return slot(p) == 0 ? row : row_r[slot(p)]; }
 };
 
 struct PartCarriers {
@@ -77,6 +89,20 @@ static DevCarrier* carrier_of(const void* model, int seq, int n_embd, int dev, c
         }
         cudaMemsetAsync(c.row, 0, b, s);
         cudaMemsetAsync(c.snap, 0, b, s);
+        static const int depth = [] {
+            const char* v = getenv("MAYA_GLM_SPEC_HEAD_RING");
+            const int n = v != nullptr ? std::atoi(v) : 1;
+            return std::max(1, std::min(DevCarrier::kMax, n));
+        }();
+        c.depth = depth;
+        for (int i = 1; i < depth; ++i) {
+            if (cudaMalloc(&c.row_r[i], b) != cudaSuccess) {
+                cudaGetLastError();
+                c.depth = 1;
+                break;
+            }
+            cudaMemsetAsync(c.row_r[i], 0, b, s);
+        }
         if (cur != dev) cudaSetDevice(cur);
     }
     return &c;
@@ -86,7 +112,9 @@ void Glm5Model::mtp_carry_note(int64_t p, const float* h, cudaStream_t s) {
     if (!mtp_state_on(g_, mtp_il_, fast_) || h == nullptr) return;
     DevCarrier* c = carrier_of(this, cur_seq_, g_.n_embd, dev_, s);
     if (c == nullptr) return;
-    cudaMemcpyAsync(c->row, h, (size_t) g_.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    const int sl = c->slot(p);
+    cudaMemcpyAsync(c->at(p), h, (size_t) g_.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    c->pos_r[sl] = p;
     c->st.note(p);
 }
 
@@ -94,6 +122,17 @@ const float* Glm5Model::mtp_carry_row(int64_t p, const float* fallback, cudaStre
     if (!mtp_state_on(g_, mtp_il_, fast_)) return fallback;
     DevCarrier* c = carrier_of(this, cur_seq_, g_.n_embd, dev_, s);
     if (c == nullptr) return fallback;
+    if (c->depth > 1) {
+        // every position has its own slot: a read at p sees exactly what a note at p left there
+        const int sl = c->slot(p);
+        ++c->st.reads;
+        if (c->pos_r[sl] == p && p >= 0) return c->at(p);
+        ++c->st.zero_reads;
+        if (c->pos_r[sl] >= 0) ++c->st.stale_reads;
+        c->pos_r[sl] = -1;
+        cudaMemsetAsync(c->at(p), 0, (size_t) g_.n_embd * sizeof(float), s);
+        return c->at(p);
+    }
     const int64_t had = c->st.pos;
     if (!c->st.use(p)) {
         cudaMemsetAsync(c->row, 0, (size_t) g_.n_embd * sizeof(float), s);
@@ -105,7 +144,7 @@ const float* Glm5Model::mtp_carry_row(int64_t p, const float* fallback, cudaStre
                                  "- zeros instead (B15.3)\n", (long long) p, (long long) had, cur_seq_);
         }
     }
-    return c->row;
+    return c->at(p);
 }
 
 void Glm5Model::mtp_carry_reset() {
@@ -115,7 +154,10 @@ void Glm5Model::mtp_carry_reset() {
     if (c == nullptr) return;
     c->st.begin();
     c->st.snap_pos = -1;
-    cudaMemsetAsync(c->row, 0, (size_t) g_.n_embd * sizeof(float), s);
+    for (int i = 0; i < c->depth; ++i) {
+        c->pos_r[i] = -1;
+        cudaMemsetAsync(i == 0 ? c->row : c->row_r[i], 0, (size_t) g_.n_embd * sizeof(float), s);
+    }
     cudaMemsetAsync(c->snap, 0, (size_t) g_.n_embd * sizeof(float), s);
 }
 
@@ -125,12 +167,18 @@ void Glm5Model::mtp_carry_snapshot(bool restore) {
     DevCarrier* c = carrier_of(this, cur_seq_, g_.n_embd, dev_, s);
     if (c == nullptr) return;
     const size_t b = (size_t) g_.n_embd * sizeof(float);
+    // R39: with a ring the row that holds st.pos is a specific slot, so the snapshot must copy from / into THAT slot.
+    const int64_t sp = c->st.pos;
+    float* live = sp >= 0 ? c->at(sp) : c->row;
     if (restore) {
         c->st.snapshot_restore();
-        cudaMemcpyAsync(c->row, c->snap, b, cudaMemcpyDeviceToDevice, s);
+        const int64_t rp = c->st.pos;
+        float* dst = rp >= 0 ? c->at(rp) : c->row;
+        cudaMemcpyAsync(dst, c->snap, b, cudaMemcpyDeviceToDevice, s);
+        if (rp >= 0) c->pos_r[c->slot(rp)] = rp;
     } else {
         c->st.snapshot_save(snap_pos_);
-        if (c->st.snap_pos >= 0) cudaMemcpyAsync(c->snap, c->row, b, cudaMemcpyDeviceToDevice, s);
+        if (c->st.snap_pos >= 0) cudaMemcpyAsync(c->snap, live, b, cudaMemcpyDeviceToDevice, s);
         else cudaMemsetAsync(c->snap, 0, b, s);
     }
 }
@@ -145,6 +193,8 @@ void Glm5Model::mtp_carry_forget() {
     for (auto& kv : it->second.seq) {
         if (kv.second.row) cudaFree(kv.second.row);
         if (kv.second.snap) cudaFree(kv.second.snap);
+        for (int i = 1; i < DevCarrier::kMax; ++i)
+            if (kv.second.row_r[i]) cudaFree(kv.second.row_r[i]);
     }
     cudaSetDevice(cur);
     g_reg.erase(it);

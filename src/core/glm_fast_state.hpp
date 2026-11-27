@@ -523,6 +523,31 @@ struct Glm5Model::FastState {
     void* head_xq = nullptr;
     float* emb = nullptr;
     int* tok = nullptr;
+    // R39: the output head's six buffers, one ring slot per position (MAYA_GLM_SPEC_HEAD_RING=<depth>, default 1 =
+    // off).  A part that runs position p+1 while its successor still reads p needs its own copy of each: the
+    // output_norm row, its q8_1 form, the logits, the picked id, the pinned id and the done event.
+    // SLOT 0 IS ALWAYS the plain buffer (head_x / head_xq / sc_+sc_logits / tok / tok_h / ev_done) - the accessors
+    // read that alias here, so depth 1 is the plain single buffers exactly and a slot-0 access can never be null.
+    // (R38 got this wrong: it aliased only three of the six, so tok_r[0] / tok_h_r[0] / ev_done_r[0] stayed null
+    // and argmax wrote through a null pointer on the first even position.)
+    static constexpr int kHeadMax = 8;
+    float* head_x_r[kHeadMax] = {};
+    void* head_xq_r[kHeadMax] = {};
+    float* logits_r[kHeadMax] = {};
+    int* tok_r[kHeadMax] = {};
+    int* tok_h_r[kHeadMax] = {};
+    cudaEvent_t ev_done_r[kHeadMax] = {};
+    int head_depth = 1;
+    int head_ring_slot(int64_t p) const {
+        if (head_depth <= 1) return 0;
+        return (int) (((p % head_depth) + head_depth) % head_depth);
+    }
+    float* head_x_at(int64_t p) { const int i = head_ring_slot(p); return i == 0 ? head_x : head_x_r[i]; }
+    void* head_xq_at(int64_t p) { const int i = head_ring_slot(p); return i == 0 ? head_xq : head_xq_r[i]; }
+    float* logits_at(int64_t p, float* plain) { const int i = head_ring_slot(p); return i == 0 ? plain : logits_r[i]; }
+    int* tok_at(int64_t p) { const int i = head_ring_slot(p); return i == 0 ? tok : tok_r[i]; }
+    int* tok_h_at(int64_t p) { const int i = head_ring_slot(p); return i == 0 ? tok_h : tok_h_r[i]; }
+    cudaEvent_t ev_done_at(int64_t p) { const int i = head_ring_slot(p); return i == 0 ? ev_done : ev_done_r[i]; }
     // the NextN block (the half that carries it): its residual, eh_proj's q8_1 input, its logits and token
     float* mtp_h = nullptr;
     void* mtp_catq = nullptr;

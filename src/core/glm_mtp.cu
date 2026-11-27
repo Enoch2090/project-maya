@@ -486,7 +486,7 @@ bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t*
 bool Glm5Model::mtp_fill_prev(int32_t token, int64_t p, std::string& err) {
     if (!mtp_dec_ || fast_ == nullptr || mtp_il_ < 0 || fast_->mtpc.cap < 1 || p < 1 || mtp_hx_pos_ != p - 1)
         return true;
-    return mtp_cache_rows(p - 1, 1, fast_->head_x, &token, err);
+    return mtp_cache_rows(p - 1, 1, fast_->head_x_at(p - 1), &token, err);   // R39: that position's ring slot
 }
 
 // ---------------------------------------------------------------- the draft length

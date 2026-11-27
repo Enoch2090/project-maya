@@ -1145,6 +1145,32 @@ bool Glm5Model::fast_setup(std::string& err) {
         return false;
     }
     if (g.arch == GlmArch::GlmDsa && !fast_dsa_arena(err)) return false;   // glm-dsa B2.4
+    // R39: MAYA_GLM_SPEC_HEAD_RING=<depth> (default 1 = off) gives the output head a ring of buffers, one slot per
+    // position.  Slot 0 is always the plain buffer (the accessors alias it), so only slots 1..depth-1 are new memory
+    // and depth 1 is exactly the single buffers of before.
+    {
+        static const int ring_depth = [] {
+            const char* v = getenv("MAYA_GLM_SPEC_HEAD_RING");
+            const int n = v != nullptr ? std::atoi(v) : 1;
+            return std::max(1, std::min(FastState::kHeadMax, n));
+        }();
+        F->head_depth = ring_depth;
+        for (int i = 1; i < ring_depth; ++i) {
+            if (cudaMalloc(&F->head_x_r[i], (size_t) E * sizeof(float)) != cudaSuccess ||
+                cudaMalloc(&F->head_xq_r[i], (size_t) E / 32 * q8) != cudaSuccess ||
+                cudaMalloc(&F->logits_r[i], (size_t) g.n_vocab * sizeof(float)) != cudaSuccess ||
+                cudaMalloc(&F->tok_r[i], 64) != cudaSuccess ||
+                cudaHostAlloc((void**) &F->tok_h_r[i], 64, cudaHostAllocDefault) != cudaSuccess ||
+                cudaEventCreateWithFlags(&F->ev_done_r[i], cudaEventDisableTiming) != cudaSuccess) {
+                err = "glm fast: the head ring did not allocate";
+                return false;
+            }
+        }
+        if (ring_depth > 1)
+            std::fprintf(stderr, "glm spec: the output head's ring, %d slots (%lld MB)\n", ring_depth,
+                         (long long) ((size_t) (ring_depth - 1) *
+                                      ((size_t) E * sizeof(float) * 2 + (size_t) g.n_vocab * sizeof(float)) / 1048576));
+    }
     if (mtp_il_ >= 0) {
         if (cudaMalloc(&F->mtp_h, (size_t) g.n_embd * sizeof(float)) != cudaSuccess ||
             cudaMalloc(&F->mtp_catq, (size_t) 2 * g.n_embd / 32 * 36) != cudaSuccess ||
@@ -4851,6 +4877,14 @@ void Glm5Model::fast_destroy() {
     if (F->pool) cudaFree(F->pool);
     for (uint8_t* p : F->pool_more) cudaFree(p);
     if (F->xpool) cudaFree(F->xpool);
+    for (int i = 1; i < FastState::kHeadMax; ++i) {
+        if (F->head_x_r[i] != nullptr) cudaFree(F->head_x_r[i]);
+        if (F->head_xq_r[i] != nullptr) cudaFree(F->head_xq_r[i]);
+        if (F->logits_r[i] != nullptr) cudaFree(F->logits_r[i]);
+        if (F->tok_r[i] != nullptr) cudaFree(F->tok_r[i]);
+        if (F->tok_h_r[i] != nullptr) cudaFreeHost(F->tok_h_r[i]);
+        if (F->ev_done_r[i] != nullptr) cudaEventDestroy(F->ev_done_r[i]);
+    }
     if (F->arena) cudaFree(F->arena);
     if (F->ps) cudaStreamSynchronize(F->ps);
     if (F->ev_hop) cudaEventDestroy(F->ev_hop);
@@ -6989,37 +7023,42 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     }
     FastState* FT = tail->fast_;
     cudaSetDevice(tail->dev_);
-    glmres::res_head(g, tail->state_, tail->w_.at("output_norm.weight"), FT->head_x, FT->head_xq, FT->cs);   // glm-dsa B2.3
-    tail->mtp_carry_note(p, FT->head_x, FT->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
+    // R39: this position's own ring slot (slot 0 = the plain buffers when the ring is off)
+    float* hx = FT->head_x_at(p);
+    void* hxq = FT->head_xq_at(p);
+    float* lg = FT->logits_at(p, tail->sc_ + tail->sc_logits);
+    int* tk = FT->tok_at(p);
+    glmres::res_head(g, tail->state_, tail->w_.at("output_norm.weight"), hx, hxq, FT->cs);   // glm-dsa B2.3
+    tail->mtp_carry_note(p, hx, FT->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
     // GLM_DUMP_H=<file> (debug): append every position's final hidden state (output_norm of the stream mean - what the
     // NextN/MTP block reads) as n_embd floats
     static const char* dh = getenv("GLM_DUMP_H");
     if (dh != nullptr && dh[0]) {
         cudaStreamSynchronize(FT->cs);
         std::vector<float> hb((size_t) g.n_embd);
-        cudaMemcpy(hb.data(), FT->head_x, hb.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(hb.data(), hx, hb.size() * sizeof(float), cudaMemcpyDeviceToHost);
         if (FILE* f = std::fopen(dh, "ab")) {
             std::fwrite(hb.data(), sizeof(float), hb.size(), f);
             std::fclose(f);
         }
     }
     const WSlot& ow = tail->ws_map_.at("output.weight");
-    gf::MvJob o = {ow.q, FT->head_xq, FT->head_x, tail->sc_ + tail->sc_logits, nullptr, 1.0f, ow.type, g.n_embd,
-                   g.n_vocab};
+    gf::MvJob o = {ow.q, hxq, hx, lg, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
     if (!gf::mv(&o, 1, FT->cs)) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
     if (FT->prof_on) FT->mark("head_mv");
-    gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, FT->tok, FT->cs);
-    cudaMemcpyAsync(FT->tok_h, FT->tok, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
-    cudaEventRecord(FT->ev_done, FT->cs);
+    gf::argmax(lg, g.n_vocab, tk, FT->cs);
+    cudaMemcpyAsync(FT->tok_h_at(p), tk, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
+    cudaEventRecord(FT->ev_done_at(p), FT->cs);
     // wait for the token (the service threads answer misses meanwhile)
     const auto tw = std::chrono::steady_clock::now();
     bool warned = false;
     cudaError_t done;
-    while ((done = cudaEventQuery(FT->ev_done)) == cudaErrorNotReady) {
+    const cudaEvent_t ev_p = FT->ev_done_at(p);
+    while ((done = cudaEventQuery(ev_p)) == cudaErrorNotReady) {
         std::this_thread::yield();
         if (!warned && std::chrono::steady_clock::now() - tw > std::chrono::seconds(10)) {
             warned = true;
@@ -7047,7 +7086,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         err = "glm fast: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)";
         return false;
     }
-    last_tok_ = FT->tok_h[0];
+    last_tok_ = FT->tok_h_at(p)[0];
     last->mtp_hx_pos_ = p;   // head_x: the trunk's hidden state of p (the MTP decode drafts from it)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ && m->fast_->prof_on) {
@@ -7123,7 +7162,9 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
             cudaMemcpyAsync(F->emb, F->emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
         }
     }
-    gf::mtp_in(F->emb, mtp_carry_row(p, F->head_x, s), Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);   // glm-dsa B15.3 (Flash: head_x)
+    // R39: the carrier-off fallback is the TRUNK's hidden state of position p, so it comes from p's ring slot
+    // (slot 0 = plain head_x when the ring is off).  The block's own head_x / head_xq below are its scratch.
+    gf::mtp_in(F->emb, mtp_carry_row(p, F->head_x_at(p), s), Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);   // glm-dsa B15.3 (Flash: head_x)
     gf::MvJob eh = {Ly.eh.q, F->mtp_catq, nullptr, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
     if (!glmdsa::mv(F->dsa.get(), &eh, 1, s)) {   // glm-dsa B2.4: a BF16/F32 eh_proj reads the dequantized input
         err = "glm mtp: eh_proj";
@@ -7135,6 +7176,9 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     gf::rms_q8(F->mtp_h, F->mixer, Ly.ffn_norm, g.norm_eps, E, F->x, F->xq, s);
     bool pf_pending = false;
     if (!fast_moe(il, pf_pending, err)) return false;
+    // R39: the draft block's head_x / head_xq are the BLOCK's own hidden state (mtp_hx_pos_ == -1 marks that), not a
+    // trunk position's - so it keeps the plain buffers on purpose.  Only the trunk's output head (forward_fast /
+    // spec_tail / spec_tail_back) takes a ring slot.
     gf::rms_q8(F->mtp_h, F->ffn, Ly.shnorm, g.norm_eps, E, F->head_x, F->head_xq, s);
     if (!head) return true;   // (the caller runs the head: several conversations' steps through it at once)
     const WSlot& ow = ws_map_.at("output.weight");
@@ -7816,20 +7860,23 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
     if (!fast_layers(p, true, err)) return false;
     // (a two-GPU split picks with the argmax here and samples on the host after it, as up to v1.1.51 - decode_spec, #860)
     const bool pick_here = n_parts_ != 2;
-    const auto enqueue_pick = [&](Glm5Model* m, FastState* FL) {
+    // R39: takes the position's ring slot (logits / picked id / pinned word / event); slot 0 = the plain buffers.
+    // pp is the position whose token this is; lg and tk are that slot's logits and device id.
+    const auto enqueue_pick = [&](Glm5Model* m, FastState* FL, int64_t pp, float* lg, int* tk) {
+        int* tkh = FL->tok_h_at(pp);
         if (pick_here && m->mtp_sample_ != nullptr && FL->spec_q != nullptr) {
-            strata::kernels::sample_verify(m->sc_ + m->sc_logits, 1, (int) g.n_vocab, *m->mtp_sample_,
+            strata::kernels::sample_verify(lg, 1, (int) g.n_vocab, *m->mtp_sample_,
                                            (const strata::kernels::SpecList*) FL->spec_q, FL->mtp_tok, m->d_tok_,
                                            FL->cs);
-            cudaMemcpyAsync(FL->tok_h, m->d_tok_, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
+            cudaMemcpyAsync(tkh, m->d_tok_, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
         } else if (pick_here && m->mtp_sample_ != nullptr) {
-            m->pick_tokens(m->sc_ + m->sc_logits, 1, *m->mtp_sample_, nullptr, 0, m->d_tok_, FL->cs);
-            cudaMemcpyAsync(FL->tok_h, m->d_tok_, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
+            m->pick_tokens(lg, 1, *m->mtp_sample_, nullptr, 0, m->d_tok_, FL->cs);
+            cudaMemcpyAsync(tkh, m->d_tok_, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
         } else {
-            gf::argmax(m->sc_ + m->sc_logits, g.n_vocab, FL->tok, FL->cs);
-            cudaMemcpyAsync(FL->tok_h, FL->tok, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
+            gf::argmax(lg, g.n_vocab, tk, FL->cs);
+            cudaMemcpyAsync(tkh, tk, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
         }
-        cudaEventRecord(FL->ev_done, FL->cs);
+        cudaEventRecord(FL->ev_done_at(pp), FL->cs);
     };
     if (split_next_) {
         // a tail GROUP: down its parts; the last one computes the head and the pick
@@ -7864,33 +7911,42 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
         }
         cudaSetDevice(m->dev_);
         FastState* FL = m->fast_;
-        glmres::res_head(g, m->state_, m->w_.at("output_norm.weight"), FL->head_x, FL->head_xq, FL->cs);   // glm-dsa B2.3
-        m->mtp_carry_note(p, FL->head_x, FL->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
+        // R39: this position's ring slot
+        float* hx = FL->head_x_at(p);
+        void* hxq = FL->head_xq_at(p);
+        float* lg = FL->logits_at(p, m->sc_ + m->sc_logits);
+        int* tk = FL->tok_at(p);
+        glmres::res_head(g, m->state_, m->w_.at("output_norm.weight"), hx, hxq, FL->cs);   // glm-dsa B2.3
+        m->mtp_carry_note(p, hx, FL->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
         const WSlot& owl = m->ws_map_.at("output.weight");
-        gf::MvJob ol = {owl.q, FL->head_xq, FL->head_x, m->sc_ + m->sc_logits, nullptr, 1.0f, owl.type, g.n_embd,
-                        g.n_vocab};
+        gf::MvJob ol = {owl.q, hxq, hx, lg, nullptr, 1.0f, owl.type, g.n_embd, g.n_vocab};
         if (owl.type == 0) ol.w = owl.f32;
         if (!gf::mv(&ol, 1, FL->cs)) {
             err = "glm spec: output head";
             return false;
         }
         if (m->fast_->prof_on) m->fast_->mark("head_mv");
-        enqueue_pick(m, FL);
+        enqueue_pick(m, FL, p, lg, tk);
         m->spec_span_end();
         cudaSetDevice(dev_);
         return true;
     }
-    glmres::res_head(g, state_, w_.at("output_norm.weight"), F->head_x, F->head_xq, F->cs);   // glm-dsa B2.3
-    mtp_carry_note(p, F->head_x, F->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
+    // R39: the non-split tail (a group of ONE part) - the branch R38 forgot
+    float* hx = F->head_x_at(p);
+    void* hxq = F->head_xq_at(p);
+    float* lg = F->logits_at(p, sc_ + sc_logits);
+    int* tk = F->tok_at(p);
+    glmres::res_head(g, state_, w_.at("output_norm.weight"), hx, hxq, F->cs);   // glm-dsa B2.3
+    mtp_carry_note(p, hx, F->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
     const WSlot& ow = ws_map_.at("output.weight");
-    gf::MvJob o = {ow.q, F->head_xq, F->head_x, sc_ + sc_logits, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
+    gf::MvJob o = {ow.q, hxq, hx, lg, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
     if (!gf::mv(&o, 1, F->cs)) {
         err = "glm spec: output head";
         return false;
     }
     if (F->prof_on) F->mark("head_mv");
-    enqueue_pick(this, F);
+    enqueue_pick(this, F, p, lg, tk);
     spec_span_end();
     if (sprof) {
         cudaEventRecord(spec_ev_[1], F->cs);
@@ -8065,20 +8121,24 @@ bool Glm5Model::spec_tail_back(Glm5Model* head, int64_t p, std::string& err) {
     m->spec_span_take();
     if (sprof) m->spec_dev_take();
     if (!m->spec_hop_in(prev, p, sprof, err)) return false;
-    glmres::res_head(g, m->state_, m->w_.at("output_norm.weight"), FL->head_x, FL->head_xq, FL->cs);   // glm-dsa B2.3
-    m->mtp_carry_note(p, FL->head_x, FL->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
+    // R39: this position's ring slot
+    float* hx = FL->head_x_at(p);
+    void* hxq = FL->head_xq_at(p);
+    float* lg = FL->logits_at(p, m->sc_ + m->sc_logits);
+    int* tk = FL->tok_at(p);
+    glmres::res_head(g, m->state_, m->w_.at("output_norm.weight"), hx, hxq, FL->cs);   // glm-dsa B2.3
+    m->mtp_carry_note(p, hx, FL->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
     const WSlot& owl = m->ws_map_.at("output.weight");
-    gf::MvJob ol = {owl.q, FL->head_xq, FL->head_x, m->sc_ + m->sc_logits, nullptr, 1.0f, owl.type, g.n_embd,
-                    g.n_vocab};
+    gf::MvJob ol = {owl.q, hxq, hx, lg, nullptr, 1.0f, owl.type, g.n_embd, g.n_vocab};
     if (owl.type == 0) ol.w = owl.f32;
     if (!gf::mv(&ol, 1, FL->cs)) {
         err = "glm spec: output head";
         return false;
     }
     if (m->fast_->prof_on) m->fast_->mark("head_mv");
-    gf::argmax(m->sc_ + m->sc_logits, g.n_vocab, FL->tok, FL->cs);
-    cudaMemcpyAsync(FL->tok_h, FL->tok, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
-    cudaEventRecord(FL->ev_done, FL->cs);
+    gf::argmax(lg, g.n_vocab, tk, FL->cs);
+    cudaMemcpyAsync(FL->tok_h_at(p), tk, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
+    cudaEventRecord(FL->ev_done_at(p), FL->cs);
     m->spec_span_end();
     if (sprof) {
         cudaEventRecord(m->spec_ev_[1], FL->cs);
@@ -8255,11 +8315,12 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     if (sample_hook) TL->mtp_sample_ = &sp;
     bool have_draft = false;   // the verify needs a draft drawn for its position: none before the first one
     // the tail's token for its last position: the argmax/sample spec_tail left in tok_h, or a sample from its logits
-    const auto take = [&](int& y) -> bool {
+    // R39: take() reads the ring slot of the position whose token it wants (slot 0 = the plain buffers).
+    const auto take = [&](int& y, int64_t pp) -> bool {
         if ((sp.greedy || (have_draft && !v51)) && sp.penalty_last_n <= 0) {
             cudaSetDevice(TL->dev_);
-            if (!glmfast::wait_event(TL->fast_->ev_done, "glm spec token", err)) return false;
-            y = TL->fast_->tok_h[0];
+            if (!glmfast::wait_event(TL->fast_->ev_done_at(pp), "glm spec token", err)) return false;
+            y = TL->fast_->tok_h_at(pp)[0];
         } else {
             // the prompt's first token (before spec_tail ran) or a request with repetition penalties
             y = (spec_sample && have_draft) ? TL->fast_sample_verify(sp, err) : TL->fast_sample(sp, err);
@@ -8308,8 +8369,8 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         sp.counter += 1;
     } else {
         cudaSetDevice(TL->dev_);
-        cudaEventRecord(TL->fast_->ev_done, TL->fast_->cs);
-        if (!take(y)) return false;
+        cudaEventRecord(TL->fast_->ev_done_at(q + 1), TL->fast_->cs);
+        if (!take(y, q + 1)) return false;
     }
     ++produced;
     ng.push(y);   // glm-dsa B14.13
@@ -8381,7 +8442,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             if (!B->spec_tail_front(hl, q + 2, err)) { ok = false; break; }
         }
         stall.step("the tail's token");
-        if (!take(y2)) { ok = false; break; }
+        if (!take(y2, q + 1)) { ok = false; break; }
         lapn(0, early ? 2 : 1);
         ++produced;
         ng.push(y2);   // glm-dsa B14.13
