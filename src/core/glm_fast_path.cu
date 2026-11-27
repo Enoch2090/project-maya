@@ -221,6 +221,17 @@ static int spec_hop_depth() {
     return d;
 }
 
+// R47: MAYA_GLM_SPEC_D2=1 - a round of the speculative decode verifies TWO tail positions instead of one: the one its
+// confirmed token stands on and the one its draft stands on, so a round hands the token stream two tokens.  Read once;
+// a two-part split and the sampling path keep the one-position round.
+static bool d2_rounds() {
+    static const bool on = [] {
+        const char* v = getenv("MAYA_GLM_SPEC_D2");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 // R30: whether the hop ring covers the WHOLE chain (a tail group's inner hops too), not only the head group.
 // A tail part with a single pinned buffer overwrites the residual its successor may still be reading a position
 // earlier.  0 = the old single-slot tail path, for an in-binary A/B.
@@ -4852,6 +4863,10 @@ void Glm5Model::fast_destroy() {
         cudaFree(kda_bak_);
         kda_bak_ = nullptr;
     }
+    if (kda_bak2_) {
+        cudaFree(kda_bak2_);
+        kda_bak2_ = nullptr;
+    }
     for (int i = 0; i < kSpecHopMax; ++i) {
         if (spec_hop_h_[i]) cudaFreeHost(spec_hop_h_[i]);
         if (spec_ev_hop_[i]) cudaEventDestroy(spec_ev_hop_[i]);
@@ -7746,22 +7761,36 @@ bool Glm5Model::spec_kda_reserve(std::string& err) {
         err = "glm spec: the recurrent-state backup did not allocate";
         return false;
     }
-    std::fprintf(stderr, "glm spec: CUDA%d the head's recurrent-state backup (%.0f MB) before the expert pool\n", dev_,
-                 (double) bytes / 1048576.0);
+    // R47 (MAYA_GLM_SPEC_D2): a round that verifies two tail positions holds TWO states of every part of the head
+    // group - the one before its first head position and the one before its second.  The second is reserved here,
+    // before the pool, for the same reason the first one is (a malloc of this size may not succeed once the pool was
+    // sized).  The tail group's parts take theirs on first use, as MAYA_GLM_SPEC_TAIL_PIPE's single slot does.
+    if (kda_bak2_ == nullptr && d2_rounds()) {
+        if (cudaMalloc(&kda_bak2_, bytes) != cudaSuccess) {
+            cudaGetLastError();
+            kda_bak2_ = nullptr;
+            err = "glm spec: the second recurrent-state backup did not allocate";
+            return false;
+        }
+    }
+    std::fprintf(stderr, "glm spec: CUDA%d the head's recurrent-state backup (%.0f MB%s) before the expert pool\n", dev_,
+                 (double) bytes / 1048576.0, kda_bak2_ != nullptr ? " x2" : "");
     return true;
 }
 
 // the head's KDA states (S + conv history of every recurrent layer here: one contiguous run each) <-> kda_bak_
-bool Glm5Model::spec_kda_copy(bool restore) {
+bool Glm5Model::spec_kda_copy(bool restore, int slot) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     if (restore && F->dsa) glmdsa::mixer_rollback(*F->dsa);   // glm-dsa B11.2: no stale selection after a rejected draft
     kda_bak_cur_ = false;
     const size_t bytes = spec_kda_bytes();
     if (bytes == 0) return true;
-    if (kda_bak_ == nullptr && cudaMalloc(&kda_bak_, bytes) != cudaSuccess) {
+    // R47: slot 1 is the two-position round's second state (before its second speculative position of this part)
+    float*& base = slot == 0 ? kda_bak_ : kda_bak2_;
+    if (base == nullptr && cudaMalloc(&base, bytes) != cudaSuccess) {
         cudaGetLastError();
-        kda_bak_ = nullptr;
+        base = nullptr;
         return false;
     }
     const size_t run = spec_kda_run(g) / sizeof(float);
@@ -7769,7 +7798,7 @@ bool Glm5Model::spec_kda_copy(bool restore) {
     for (int il = l0_; il < l1_; ++il)
         if (g.is_recr(il)) {
             float* live = state_ + kda_S_[(size_t) il];
-            float* bak = kda_bak_ + (size_t) k++ * run;
+            float* bak = base + (size_t) k++ * run;
             cudaMemcpyAsync(restore ? live : bak, restore ? bak : live, run * sizeof(float), cudaMemcpyDeviceToDevice,
                             F->cs);
         }
@@ -8368,11 +8397,12 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
                                                         "(MAYA_GLM_SPEC_CANCEL)"
                                                       : "MAYA_GLM_SPEC_CANCEL needs a head group of one GPU - not used");
     }
-    // the head group's recurrent-state backups (each part on its own device and stream)
-    const auto kda_all = [&](bool restore) -> bool {
+    // the head group's recurrent-state backups (each part on its own device and stream).  R47: slot 0 is the state
+    // before the round's first head position and slot 1 the state before its second
+    const auto kda_all = [&](bool restore, int slot = 0) -> bool {
         for (Glm5Model* m = this; m != hl->split_next_.get(); m = m->split_next_.get()) {
             cudaSetDevice(m->dev_);
-            if (!m->spec_kda_copy(restore)) return false;
+            if (!m->spec_kda_copy(restore, slot)) return false;
         }
         cudaSetDevice(dev_);
         return true;
@@ -8413,12 +8443,22 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         const char* v = getenv("MAYA_GLM_SPEC_TAIL_PIPE");
         return v != nullptr && std::atoi(v) != 0;
     }();
-    const auto tail_kda = [&](bool restore) -> bool {
-        if (!tail_pipe) return true;
-        cudaSetDevice(B->dev_);
-        const bool ok2 = B->spec_kda_copy(restore);
+    // R47: a redo of a tail position has to put back EVERY part of the tail group's recurrent states (the two-position
+    // round restores its second position, which is not the first part's).  MAYA_GLM_SPEC_TAIL_PIPE's own single slot
+    // stays what it was.
+    const auto tail_kda = [&](bool restore, int slot = 0) -> bool {
+        const bool whole = d2_rounds();
+        if (!tail_pipe && !whole) return true;
+        Glm5Model* end = whole ? nullptr : B->split_next_.get();
+        for (Glm5Model* m = B; m != end; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            if (!m->spec_kda_copy(restore, slot)) {
+                cudaSetDevice(dev_);
+                return false;
+            }
+        }
         cudaSetDevice(dev_);
-        return ok2;
+        return true;
     };
     const bool v51 = n_parts_ == 2;
     const bool tail_samples = !v51 && !sp.greedy && sp.penalty_last_n <= 0;
@@ -8501,7 +8541,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     stall.phase("the tail's first position");
     if (!B->spec_tail(hl, q + 1, err)) return false;
     cudaSetDevice(dev_);
-    if (!kda_all(false)) {
+    if (!kda_all(false, 1)) {   // the state before the head's q+2 (R47: slot 1 - a round restores it from there)
         err = "glm spec: the recurrent-state backup did not allocate";
         return false;
     }
@@ -8557,6 +8597,40 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             std::fprintf(stderr, "glm spec: the draft takes a second chained step (MAYA_GLM_MTP_CHAIN2=1)\n");
         }
         cudaSetDevice(dev_);
+    }
+    // R47 (MAYA_GLM_SPEC_D2=1): a round of the spec decode that verifies TWO positions of the tail.  The round's
+    // first position is the one its confirmed token stands on and the second the one its draft stands on, so one round
+    // hands the token stream two tokens (both are the tail's own argmax) and moves the position on by two.  What a
+    // draft that turns out wrong costs is the work of running the head's and the tail's second position again, not a
+    // token.  It needs: the draft block's chained second step (the guess for the token two positions on), a second
+    // recurrent-state backup per part (slot 1 of spec_kda_copy), a hop ring deeper than two positions and the head
+    // ring (R39) at 3 or more - MAYA_GLM_SPEC_HOP=4 MAYA_GLM_SPEC_HEAD_RING=4.
+    bool d2_on = false;
+    int* d3_h = nullptr;          // pinned: the chained draft's token
+    cudaEvent_t d3_ev = nullptr;
+    if (d2_rounds()) {
+        cudaSetDevice(TL->dev_);
+        const bool fine = cudaHostAlloc((void**) &d3_h, 64, cudaHostAllocDefault) == cudaSuccess &&
+                          cudaEventCreateWithFlags(&d3_ev, cudaEventDisableTiming) == cudaSuccess;
+        if (!fine) {
+            cudaGetLastError();
+            if (d3_h != nullptr) cudaFreeHost(d3_h);
+            d3_h = nullptr;
+            if (d3_ev != nullptr) cudaEventDestroy(d3_ev);
+            d3_ev = nullptr;
+            std::fprintf(stderr, "glm spec: MAYA_GLM_SPEC_D2 - its event did not allocate; one position a round\n");
+        } else {
+            d2_on = true;
+        }
+        cudaSetDevice(dev_);
+        if (d2_on) {
+            std::fprintf(stderr, "glm spec: two tail positions a round (MAYA_GLM_SPEC_D2=1, hop ring %d, head ring %d)\n",
+                         spec_hop_depth(), TL->fast_->head_depth);
+            if (spec_hop_depth() < 4 || TL->fast_->head_depth < 3)
+                std::fprintf(stderr, "glm spec: MAYA_GLM_SPEC_D2 wants MAYA_GLM_SPEC_HOP>=4 and "
+                                     "MAYA_GLM_SPEC_HEAD_RING>=3 - a ring of two would let this round overwrite a "
+                                     "position it is still reading\n");
+        }
     }
     auto tnow = std::chrono::steady_clock::now();
     static const char* const lap_names[6] = {"wait tail", "draft", "redo", "enqueue tail", "enqueue head", "emit"};
@@ -8628,6 +8702,9 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         const bool more = emit(y2) && produced < max_new && q + 3 < max_ctx_;
         if (!more) break;
         const bool wrong = d != y2;
+        // R47: the round of two positions - a two-part split, the sampling path and the last positions of a request
+        // keep the one-position round
+        const bool d2_round = d2_on && !sample_hook && !tail_pipe && produced + 1 < max_new && q + 4 < max_ctx_;
         // the draft for q+2 against the truth: B11.3's acceptance (the NextN block's own draft - an n-gram one is the
         // n-gram chooser's - for MAYA_GLM_SPEC_LOG / _TRACE and the unload summary), then the n-gram chooser's verdict
         glmspec::note(this, 1, q + 2, ng.mtp_draft(d), y2);
@@ -8665,6 +8742,101 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             lap(3);
             kda_all(false);
             if (cancel) fast_->spec_cancellable = true;   // q+3 with the new draft: speculative
+        } else if (d2_round) {
+            // ---- R47: the round of two positions ------------------------------------------------------------------
+            ++spec_steps_;
+            if (!wrong) ++spec_hits_;
+            // (a) the head's q+2 stood on a wrong token: put the head group back to before q+2 and run it again (the
+            //     tail's q+2 follows below, so it needs no restore of its own)
+            if (wrong) {
+                cudaSetDevice(dev_);
+                if (!kda_all(true, 1)) { err = "glm spec: the recurrent-state restore"; ok = false; break; }
+                stall.phase("the head's redo");
+                if (!spec_head(q + 2, y2, err)) { ok = false; break; }
+                lap(2);
+            }
+            static const bool mtp_stream2 = [] {
+                const char* v = getenv("MAYA_GLM_MTP_STREAM");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            const int64_t dp = q + 1;
+            // (b) the draft for the token at q+3 - the one the round's second position will stand on
+            cudaSetDevice(TL->dev_);
+            {
+                const cudaStream_t sv = TL->fast_->cs;
+                if (mtp_stream2 && TL->fast_->cs_mtp != nullptr) TL->fast_->cs = TL->fast_->cs_mtp;
+                const bool okd = TL->fast_mtp(dp, y2, err);
+                TL->fast_->cs = sv;
+                if (!okd) { ok = false; break; }
+            }
+            if (!glmfast::wait_event(TL->fast_->ev_mtp, "glm spec draft", err)) { ok = false; break; }
+            const int d2v = draft_ok(TL->fast_->mtp_tok_h[0], y2);
+            if (!TL->fast_->route_ok(err)) { ok = false; break; }
+            have_draft = true;
+            // (c) the draft block's chained step: the guess for the token at q+4, the one the head's q+4 stands on.
+            //     Its carrier is the block's own hidden state of the step above, read on the same stream before this
+            //     step overwrites it (R42's probe priced this step at +0.014 ms a round).
+            {
+                cudaSetDevice(TL->dev_);
+                const cudaStream_t sv = TL->fast_->cs;
+                if (mtp_stream2 && TL->fast_->cs_mtp != nullptr) TL->fast_->cs = TL->fast_->cs_mtp;
+                std::string e3;
+                const bool ok3 = TL->fast_mtp(dp + 1, d2v, e3, 1, false, true, nullptr, true, TL->fast_->head_x) &&
+                                 cudaMemcpyAsync(d3_h, TL->fast_->mtp_tok + 1, sizeof(int), cudaMemcpyDeviceToHost,
+                                                 TL->fast_->cs) == cudaSuccess &&
+                                 cudaEventRecord(d3_ev, TL->fast_->cs) == cudaSuccess;
+                TL->fast_->cs = sv;
+                if (!ok3) {
+                    cudaGetLastError();
+                    err = "glm spec: the chained draft (" + e3 + ")";
+                    ok = false;
+                    break;
+                }
+            }
+            // (d) the tail's first position of the round: q+2, its hop the head's q+2 of the last round
+            stall.phase("the tail's next position");
+            if (!B->spec_tail(hl, q + 2, err)) { ok = false; break; }
+            lap(3);
+            // (e) the head's two positions for the tail's NEXT round: q+3 on the draft, q+4 on the chained guess
+            cudaSetDevice(dev_);
+            if (!kda_all(false, 0)) { err = "glm spec: the recurrent-state backup"; ok = false; break; }   // before q+3
+            stall.phase("the head's next position");
+            if (!spec_head(q + 3, d2v, err)) { ok = false; break; }
+            if (!glmfast::wait_event(d3_ev, "glm spec chained draft", err)) { ok = false; break; }
+            const int d3 = draft_ok(d3_h[0], d2v);
+            cudaSetDevice(dev_);
+            if (!kda_all(false, 1)) { err = "glm spec: the recurrent-state backup"; ok = false; break; }   // before q+4
+            if (!spec_head(q + 4, d3, err)) { ok = false; break; }
+            lap(4);
+            ++spec_steps_;
+            // (f) the tail's second position: q+3, its hop the head's q+3 just enqueued (the device waits for it)
+            if (!tail_kda(false, 0)) { err = "glm spec: the tail's backup"; ok = false; break; }
+            stall.phase("the tail's second position");
+            if (!B->spec_tail(hl, q + 3, err)) { ok = false; break; }
+            // (g) the round's second token: the tail's q+2 wrote it, and its input was the confirmed token y2
+            int y3 = -1;
+            if (!take(y3, q + 2)) { ok = false; break; }
+            ++produced;
+            ng.push(y3);
+            vocab_note(y3);
+            if (!emit(y3) || produced >= max_new) break;
+            // (h) the tail's q+3 stood only if the head's q+3 did: the draft d2 against the token at q+3.  If it did
+            //     not, both groups go back to before q+3 and run q+3 (and the head's q+4 behind it) again.
+            if (d2v != y3) {
+                cudaSetDevice(dev_);
+                if (!kda_all(true, 0)) { err = "glm spec: the recurrent-state restore"; ok = false; break; }
+                if (!spec_head(q + 3, y3, err)) { ok = false; break; }
+                if (!kda_all(false, 1)) { err = "glm spec: the recurrent-state backup"; ok = false; break; }
+                if (!spec_head(q + 4, d3, err)) { ok = false; break; }
+                if (!tail_kda(true, 0)) { err = "glm spec: the tail's restore"; ok = false; break; }
+                if (!B->spec_tail(hl, q + 3, err)) { ok = false; break; }
+            }
+            lap(1);
+            d = d3;          // the next round's check: the guess the head's q+4 stands on
+            q += 2;
+            ++np;
+            if (!check()) { ok = false; break; }
+            continue;
         } else {
             // a wrong draft: the head's standing speculative pass for q+2 is redone with the true token.  This must
             // go BEFORE the tail's q+2 enqueue: the tail's pass snapshots the head's hop event as it is enqueued, so
@@ -8675,9 +8847,9 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
                 if (cancel) {
                     *(volatile int*) fast_->spec_live_h = 0;
                     std::atomic_thread_fence(std::memory_order_seq_cst);
-                    kda_all(true);
+                    kda_all(true, 1);
                 } else {
-                    kda_all(true);
+                    kda_all(true, 1);
                 }
                 // R30: the tail's first part ran q+2 off the WRONG draft's hop, so its recurrent states go back and
                 // it runs q+2 again - after the head's redo, so the hop it waits on is the corrected one.
@@ -8725,7 +8897,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             stall.phase("the tail's next position");
             if (fronted ? !B->spec_tail_back(hl, q + 2, err) : !B->spec_tail(hl, q + 2, err)) { ok = false; break; }
             lap(3);
-            kda_all(false);
+            kda_all(false, 1);   // the state before the head's q+3: the next round restores it if its draft was wrong
             if (cancel) fast_->spec_cancellable = true;   // q+3 with the new draft: speculative
             cudaSetDevice(TL->dev_);
             if (!glmfast::wait_event(TL->fast_->ev_mtp, "glm spec draft", err)) { ok = false; break; }
@@ -8788,7 +8960,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     // the head's recurrent states back to the tail's position (the backup after q+1): the whole model then stands at
     // pos_ exactly, so a snapshot taken now (the server's PAUSE) continues the sequence; a reset or a restore after
     // this overwrites them anyway
-    if (ok && !kda_all(true)) ok = false;
+    if (ok && !kda_all(true, 1)) ok = false;
     if (sprof && np > 0) {
         std::fprintf(stderr, "glm spec prof (%lld steps, ms/step%s): wait tail token %.2f | draft %.2f | redo %.2f | "
                              "enqueue tail %.2f | enqueue head %.2f | emit %.2f\n", (long long) np,

@@ -787,6 +787,8 @@ public:
     void spec_span_end();
     void spec_span_take();
     float* kda_bak_ = nullptr;                             // the head's saved recurrent states
+    float* kda_bak2_ = nullptr;                            // R47 (MAYA_GLM_SPEC_D2): the state before the round's
+                                                           // second speculative position, same size as the first
     bool kda_bak_cur_ = false;   // win_commit_part left kda_bak_ equal to the live states (the next pipelined begin's
                                  // backup is not needed)
     // R25: the hop slots, kSpecHopMax of them, addressed modulo the depth in use (spec_hop_depth(): MAYA_GLM_SPEC_HOP,
@@ -795,7 +797,7 @@ public:
     static constexpr int kSpecHopMax = 8;
     float* spec_hop_h_[kSpecHopMax] = {};                  // pinned hop slots, by position (modulo the depth)
     cudaEvent_t spec_ev_hop_[kSpecHopMax] = {};
-    bool spec_kda_copy(bool restore);
+    bool spec_kda_copy(bool restore, int slot = 0);        // R47: slot 1 = the second backup
     size_t spec_kda_bytes() const;                         // the head's saved recurrent states on this part
     bool spec_kda_reserve(std::string& err);               // ... taken at setup, before the expert pool
     // the speculative decode on a split of more than two parts: the HEAD GROUP is this part and the ones after it
