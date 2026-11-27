@@ -1181,14 +1181,37 @@ template<> __device__ __forceinline__ float dw_tab<21>(const uint8_t* row, int k
     return __half2float(bq3->d) * x.d * sumi;
 }
 // the same rows loop, but each row's dot through the sign table
-template<int T, int NR>
+// R45: KU is how many 32-value groups one lane keeps in flight (the k loop unrolled KU ways).  A row's adds still
+// come in the same order - lane, lane+32, lane+64, ... - because the stride is 32*KU and the KU groups of one step are
+// visited in increasing k, so only the schedule changes: the next group's codebook and sign loads issue before the
+// previous group's dp4a chain resolves.  KU=1 is the shipped loop, statement for statement.
+template<int T, int NR, int KU = 1>
 __device__ __forceinline__ void rows_dot_tab(const uint8_t* const* rows, const block_q8_1* x, int n_in, int lane,
                                              const uint32_t* tab, const uint4* st, float* s) {
     float acc[NR] = {};
-    for (int k = lane; k < n_in / 32; k += 32) {
-        const XV xv = load_xv<T == 16 || T == 22>(x + k);
+    const int ng = n_in / 32;
+    if constexpr (KU <= 1) {
+        for (int k = lane; k < ng; k += 32) {
+            const XV xv = load_xv<T == 16 || T == 22>(x + k);
 #pragma unroll
-        for (int r = 0; r < NR; ++r) acc[r] += dw_tab<T>(rows[r], k / 8, 2 * (k % 8), xv, tab, st);
+            for (int r = 0; r < NR; ++r) acc[r] += dw_tab<T>(rows[r], k / 8, 2 * (k % 8), xv, tab, st);
+        }
+    } else {
+        for (int k0 = lane; k0 < ng; k0 += 32 * KU) {
+            int ks[KU];
+            XV xv[KU];
+#pragma unroll
+            for (int u = 0; u < KU; ++u) {
+                ks[u] = k0 + 32 * u;
+                if (ks[u] < ng) xv[u] = load_xv<T == 16 || T == 22>(x + ks[u]);
+            }
+#pragma unroll
+            for (int u = 0; u < KU; ++u) {
+                if (ks[u] >= ng) continue;
+#pragma unroll
+                for (int r = 0; r < NR; ++r) acc[r] += dw_tab<T>(rows[r], ks[u] / 8, 2 * (ks[u] % 8), xv[u], tab, st);
+            }
+        }
     }
 #pragma unroll
     for (int r = 0; r < NR; ++r) s[r] = warp_sum(acc[r]);
@@ -5069,7 +5092,8 @@ constexpr int R6_GX_WORDS = (4096 / 32) * (int) (sizeof(block_q8_1) / 4);
 // into sh_out while the routed experts' blocks run - in moe_down it was a serial tail (~25 us of 72)
 #if (defined(STRATA_USE_HIP) || defined(STRATA_USE_MUSA))
 template<int TG, int NW = GU_WARPS, bool LUT = false, bool GLOBAL = false, bool SPLIT = false,
-         bool DIRECT = false, bool WIDE = false, int MINWAVES = 0, bool MULTI = false, bool STG = false>
+         bool DIRECT = false, bool WIDE = false, int MINWAVES = 0, bool MULTI = false, bool STG = false,
+         int KU = 1>
 __attribute__((amdgpu_waves_per_eu(MINWAVES > 0 ? MINWAVES : 1)))
 __global__ void __launch_bounds__(NW * 32)
 #else
@@ -5180,7 +5204,7 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     if constexpr (LUT) {
         // R3: the sign table when the launch asked for it (sign_tab_on<TG> only admits IQ3_S)
         if constexpr (sign_tab_on<TG>) {
-            if (sign_tab) rows_dot_tab<TG, 2 * RPW>(rows, xg, n_embd, lane, tab, s_stab, s);
+            if (sign_tab) rows_dot_tab<TG, 2 * RPW, KU>(rows, xg, n_embd, lane, tab, s_stab, s);
             else rows_dot_rdna<TG, 2 * RPW>(rows, xg, n_embd, lane, tab, s_sign, s, DIRECT, WIDE);
         } else {
             rows_dot_rdna<TG, 2 * RPW>(rows, xg, n_embd, lane, tab, s_sign, s, DIRECT, WIDE);
@@ -7637,6 +7661,23 @@ bool gu_nw16() {
     }();
     return on;
 }
+// R45: the gate/up block shape and k unroll under test, 0 (unset) is the shipped dispatch.
+//   1 = NW=32 (1024 threads, 32+32 rows, 112.6 KB a block; the shipped shape), 2 groups in flight
+//   2 = NW=16 (512 threads, the same 32+32 rows, RPW=2), sign table, 2 groups in flight
+//   3 = NW=16, sign table, shipped k loop (separates the 512-thread shape from the unroll)
+//   4 = NW=16 with the shipped direct sign expansion, shipped k loop (what MAYA_GLM_GU_NW=16 runs)
+//   5 = NW=16, direct signs, 2 groups in flight
+// The 118.2 GB/s probe shape (16+16 rows = 55 KB) is not reachable from here: GU_ROWS is one q8_1 activation block
+// and q8_1_store_warp needs all 32 of its values in one warp, so a 16-row block would have to hand its rows to a
+// second quantising pass.  Modes 1-5 are the same two knobs at the engine's own 32-row block.
+int gu_r45_mode() {
+    static const int mode = [] {
+        const char* v = std::getenv("MAYA_GLM_R45_GU");
+        return v != nullptr ? std::atoi(v) : 0;
+    }();
+    return mode;
+}
+bool gu_r45_stab16() { const int m = gu_r45_mode(); return m == 2 || m == 3; }
 // Splitting shared down removes its dynamic type switch from routed gate/up's
 // register budget. The routed grid keeps exactly the original dot/reduction order.
 __global__ void __launch_bounds__(256) rdna_shared_down_kernel(const uint8_t* weights, int type,
@@ -7650,7 +7691,7 @@ __global__ void __launch_bounds__(256) rdna_shared_down_kernel(const uint8_t* we
     }
 }
 template<int T, int NW, bool GLOBAL = false, bool LUT = true, bool SPLIT = false,
-         bool DIRECT = false, bool WIDE = false, int MINWAVES = 0>
+         bool DIRECT = false, bool WIDE = false, int MINWAVES = 0, int KU = 1>
 void launch_expert_gu(const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
                const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s) {
     const bool shared = sh_down && sh_out;
@@ -7658,19 +7699,22 @@ void launch_expert_gu(const MoeDev& d, int k, int n_embd, int n_ff, float limit,
     // R6: IQ3_S at NW=32 (the decode path) can stage the activation; every other instantiation is the shipped
     // program, byte for byte.  The SPLIT tail below runs for BOTH arms - the first cut of this patch returned
     // early and silently skipped the shared expert's down projection (acceptance 241 -> 60 drafts).
-    const int stab = (T == 21 && NW == 32) ? (int) gu_sign_tab() : 0;
+    // R45: the NW=16 arm used to fall back to the direct sign expansion (hip_fast_signs' four multiplies) while
+    // NW=32 read the shared table; the table is the same function of the same sign byte (R3), so mode 2/3 turns it on
+    // for NW=16 as well - that is the only way to compare the two shapes on the same sign expansion.
+    const int stab = (T == 21 && (NW == 32 || gu_r45_stab16())) ? (int) gu_sign_tab() : 0;
     const bool stg = (T == 21 && NW == 32) && musa_gu_stage();
     if constexpr (T == 21 && NW == 32) {
         if (stg)
-            moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES, false, true><<<grid, NW * 32, 0, s>>>(
+            moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES, false, true, KU><<<grid, NW * 32, 0, s>>>(
                 d, shared ? k : k + 1, n_embd, n_ff, limit, (const block_q8_1*) xq, (block_q8_1*) hq,
                 (const uint8_t*) sh_down, sh_type, (const block_q8_1*) sh_hq, n_ff_sh, sh_out, stab);
         else
-            moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES, false, false><<<grid, NW * 32, 0, s>>>(
+            moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES, false, false, KU><<<grid, NW * 32, 0, s>>>(
                 d, shared ? k : k + 1, n_embd, n_ff, limit, (const block_q8_1*) xq, (block_q8_1*) hq,
                 (const uint8_t*) sh_down, sh_type, (const block_q8_1*) sh_hq, n_ff_sh, sh_out, stab);
     } else {
-        moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES><<<grid, NW * 32, 0, s>>>(
+        moe_gate_up_kernel<T, NW, LUT, GLOBAL, SPLIT, DIRECT, WIDE, MINWAVES, false, false, KU><<<grid, NW * 32, 0, s>>>(
             d, shared ? k : k + 1, n_embd, n_ff, limit, (const block_q8_1*) xq, (block_q8_1*) hq,
             (const uint8_t*) sh_down, sh_type, (const block_q8_1*) sh_hq, n_ff_sh, sh_out, stab);
     }
@@ -7742,7 +7786,23 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
             // that every weight address waits on - has no other block to hide behind.  NW=16 is 512 threads: two
             // blocks a SM, same 32 rows and the same dot order, so the sums are identical (the row split is still
             // chunk * GU_ROWS).  MAYA_GLM_GU_NW=16 for the A/B.
-            if (gu_nw16()) {
+            const int r45 = gu_r45_mode();
+            if (r45 == 1) {
+                launch_expert_gu<21, 32, false, true, true, true, true, 0, 2>(d, k, n_embd, n_ff, limit,
+                    xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+            } else if (r45 == 2) {
+                launch_expert_gu<21, 16, false, true, true, true, true, 0, 2>(d, k, n_embd, n_ff, limit,
+                    xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+            } else if (r45 == 3) {
+                launch_expert_gu<21, 16, false, true, true, true, true, 0, 1>(d, k, n_embd, n_ff, limit,
+                    xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+            } else if (r45 == 4) {
+                launch_expert_gu<21, 16, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
+                    xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+            } else if (r45 == 5) {
+                launch_expert_gu<21, 16, false, true, true, true, true, 0, 2>(d, k, n_embd, n_ff, limit,
+                    xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+            } else if (gu_nw16()) {
                 launch_expert_gu<21, 16, false, true, true, true, true>(d, k, n_embd, n_ff, limit,
                     xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
             } else {
