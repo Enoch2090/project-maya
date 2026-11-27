@@ -817,6 +817,20 @@ void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* d
 
 using glmfast::read_slice;
 
+namespace {
+// R44 (MAYA_GLM_HEAD_MERGE): the trunk's head launch takes the draft block's head as a SECOND COLUMN of the same pass
+// over output.weight, instead of a second launch that reads the same 520.4 MB.  Off unless asked: the draft's head
+// runs while the tail group's pass is still going, and the merge moves its pick to the end of that pass (the round's
+// numbers for both are in RALPH_PERF_STATE R44).
+bool head_merge_on() {
+    static const bool on = [] {
+        const char* v = getenv("MAYA_GLM_HEAD_MERGE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+}  // namespace
+
 static float* fa_take(uint8_t*& at, size_t floats) {
     float* p = (float*) at;
     at += (floats * sizeof(float) + 255u) & ~(size_t) 255u;
@@ -1069,6 +1083,8 @@ bool Glm5Model::fast_setup(std::string& err) {
                 8 * 16 + (size_t) (g.arch == GlmArch::GlmDsa ? gf::kMaxEmbd : 4096) * 4 + 4 * 256 + (size_t) g.n_expert * 4 + 256 + 4 * 256;
         need += (size_t) gf::kAhead * g.n_expert * sizeof(float) + 256 + (size_t) E * sizeof(float) + 256;
         need += (size_t) g.n_sel_max() * sizeof(int) + 256;   // slot_cells
+        // R44: MAYA_GLM_HEAD_MERGE's pair buffers (two q8_1 columns of n_embd and two logits buffers)
+        if (head_merge_on()) need += (size_t) 2 * E / 32 * q8 + (size_t) 2 * g.n_vocab * sizeof(float) + 256;
     }
     if (cudaMalloc(&F->arena, need) != cudaSuccess) {
         err = "glm fast: the activation arena did not allocate";
@@ -1121,6 +1137,12 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->dhq = fa_take_b(at, (size_t) g.n_ff_dense / 32 * q8);
     F->head_x = fa_take(at, E);
     F->head_xq = fa_take_b(at, (size_t) E / 32 * q8);
+    // R44: the merged head's two inputs (the trunk's q8_1 and the block's, one xq stride apart) and their two logits
+    // (one vocabulary apart) - taken only when the merge is on, so an off run's memory is what it always was
+    if (head_merge_on()) {
+        F->mtp_hxq_pair = fa_take_b(at, (size_t) 2 * E / 32 * q8);
+        F->mtp_hx_pair = fa_take(at, (size_t) 2 * g.n_vocab);
+    }
     F->emb = fa_take(at, E);
     F->tok = (int*) fa_take_b(at, 64);
     F->n_keys = NL * g.n_expert;
@@ -4786,6 +4808,14 @@ void Glm5Model::fast_destroy() {
                          "glm fast gemv ledger CUDA%d (%llu tokens, %.1f MB/token of weight rows, %.2f ms/token of "
                          "the ledger's own intervals, %.1f GB/s of it):\n", dev_, (unsigned long long) ltokens, tmb, tms,
                          tms > 0.0 ? tmb / tms : 0.0);
+            // R44: a stage's ms is ONE interval between two marks, so it holds whatever the host or another device
+            // did in between - a wait for another device, a tier fetch, a read-back - and is NOT the kernels' time.
+            // A GB/s divided by it is a floor, not a bandwidth the card reached (R43: dsa_proj_mv's 1.409 ms was
+            // about 1.0 ms of waiting).  Reading it as kernel time is how two earlier conclusions went wrong; the
+            // cheap fix is this line, an honest one would be a second event pair around the launches only.
+            std::fprintf(stderr,
+                         "  (ms = the interval between two marks, host waits and the other devices' work included: "
+                         "the GB/s below is a floor, not the kernel's bandwidth.  jobs = per token)\n");
             std::string last;
             for (const auto& r : rows) {
                 const double mb = r.bytes / ntok / 1e6;
@@ -4799,10 +4829,13 @@ void Glm5Model::fast_destroy() {
                                  r.stage.c_str(), sms, smb, sms > 0.0 ? smb / sms : 0.0,
                                  100.0 * r.ms / std::max(1e-9, tot_ms));
                 }
-                std::fprintf(stderr, "      type %-3d (%-4s) nc=%-3d jobs=%-8llu %8.1f MB\n", r.type,
+                // R44: `jobs` counts the launches of EVERY counted token, so it is divided by the token count
+                // exactly as the bytes above are (before R44 the column showed them summed: 248x too large, and
+                // that is where "the MoE block is 29 KB" came from - the block is 110 KB, the divisor was 248)
+                std::fprintf(stderr, "      type %-3d (%-4s) nc=%-3d jobs=%-8.2f %8.1f MB\n", r.type,
                              r.type == 30 ? "BF16" : r.type == 14 ? "Q6_K" : r.type == 16 ? "IQ2_XXS" : r.type == 12
                                      ? "Q4_K" : r.type == 22 ? "IQ2_S" : r.type == 18 ? "IQ3_XXS" : "?",
-                             r.ncol, (unsigned long long) r.jobs, mb);
+                             r.ncol, (double) r.jobs / ntok, mb);
             }
         }
     }
@@ -7142,11 +7175,17 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
         return v != nullptr && std::atoi(v) != 0;
     }();
     const bool sample_draft_on = mtp_sample_ != nullptr && F->spec_q != nullptr && step == 0;
+    // R44 (MAYA_GLM_HEAD_MERGE): the caller (decode_spec) has armed this step's head to be run by the trunk's own head
+    // launch, as its second column - same device, same stream, and that launch is enqueued right after this block.
+    const bool merge_head = F->mtp_head_merge_arm && head && step == 0 && s == F->cs && F->mtp_hxq_pair != nullptr &&
+                            F->mtp_hx_pair != nullptr;
     // (a two-GPU split: only where the caller asks for it, as up to v1.1.51 - its speculative decode drafts over the
     // whole head, #860.)  3+ GPUs (decode_spec asks nothing): the draft vocabulary while the answer stays in it, the
     // whole head while it does not - mtp_out_ (decode_spec keeps it) under decode_mtp's 2%.  One GPU: the caller's
     // choice (decode_mtp's own rule on mtp_out_; mtp_draft asks for the vocabulary)
-    sub = (sub || (!full_head && !sample_draft_on && n_parts_ > 2 && mtp_out_ < 0.02)) && F->mtp_dv > 0;
+    // (R44: a sub-vocabulary draft would read a different set of rows than the trunk's head, so it cannot be a
+    // second column of the same launch - and with the merge the whole head's rows come free)
+    sub = (sub || (!full_head && !sample_draft_on && n_parts_ > 2 && mtp_out_ < 0.02)) && F->mtp_dv > 0 && !merge_head;
     mtp_hx_pos_ = -1;   // head_x becomes the block's own hidden state
     if (next_tok < 0) {
         if (F->mtp_emb == nullptr || step < 1) {
@@ -7188,6 +7227,10 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
         err = "glm mtp: eh_proj";
         return false;
     }
+    // R44: this launch (blk.45.nextn.eh_proj.weight, Q6_K 8192x4096 = 27.5 MB) had no mark of its own, so the
+    // ledger gave it to the next stage's mark - fast_dsa's dsa_proj_mv, which it then halved (R43: the "45.8 GB/s"
+    // was this matrix on top of three 6.88 MB mixers).  Its own name keeps the two apart.
+    if (F->prof_on) F->mark("mtp_eh_proj");
     gf::rms_q8(F->mtp_h, nullptr, Ly.attn_norm, g.norm_eps, E, F->x, F->xq, s);
     if (glmfast::submit_every() > 0) glmfast::submit_queued(s);   // (Windows HIP: the GPU starts while the rest queues)
     if (!fast_dsa(il, p, err)) return false;
@@ -7197,8 +7240,18 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     // R39: the draft block's head_x / head_xq are the BLOCK's own hidden state (mtp_hx_pos_ == -1 marks that), not a
     // trunk position's - so it keeps the plain buffers on purpose.  Only the trunk's output head (forward_fast /
     // spec_tail / spec_tail_back) takes a ring slot.
-    gf::rms_q8(F->mtp_h, F->ffn, Ly.shnorm, g.norm_eps, E, F->head_x, F->head_xq, s);
+    // R44: with the merged head the block's q8_1 input is the pair buffer's second column (one xq stride past the
+    // trunk's, which spec_tail_head writes at the head's position)
+    gf::rms_q8(F->mtp_h, F->ffn, Ly.shnorm, g.norm_eps, E, F->head_x,
+               merge_head ? (void*) ((char*) F->mtp_hxq_pair + (size_t) (E / 32) * 36) : F->head_xq, s);
     if (!head) return true;   // (the caller runs the head: several conversations' steps through it at once)
+    if (merge_head) {         // R44: spec_tail_head runs it, in the trunk's launch, and picks after it
+        F->mtp_head_deferred = true;
+        F->mtp_head_step = step;
+        F->mtp_head_read_back = read_back;
+        F->mtp_head_n_out = g.n_vocab;
+        return true;
+    }
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o[2];
     o[0] = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
@@ -7218,6 +7271,7 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
         err = "glm mtp: the head";
         return false;
     }
+    if (F->prof_on) F->mark("mtp_head_mv");   // R44: this row had no mark of its own either (it showed as "unattributed")
     if (mtp_sample_ != nullptr && F->spec_q != nullptr && step == 0 && !sub)   // speculative sampling (decode_spec)
         strata::kernels::sample_draft(F->mtp_logits, 1, (int) g.n_vocab, *mtp_sample_,
                                       (strata::kernels::SpecList*) F->spec_q, F->mtp_tok, s);
@@ -7836,6 +7890,73 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     return true;
 }
 
+// R44 (MAYA_GLM_HEAD_MERGE): a tail part's output head for position p in one place - the output_norm row, its q8_1
+// form, the head GEMV - with the draft block's head as a SECOND COLUMN of that same launch when fast_mtp has just left
+// one for it.  One pass over output.weight's rows then serves both: the probe (tools/probe_r44_mvcol.cu, one S4000,
+// the head's own shape) is 1.84 ms for one column, 2.64 ms for two, against 3.68 ms for the two launches, and each
+// column's sum is the one-column kernel's bit for bit (0 of 154880 rows differ, both ncol=2 kernel paths).
+// The draft's logits land in mtp_logits and its pick/read-back finish here too (mtp_head_finish), so the decode's
+// wait for ev_mtp reads the same event it always did.
+bool Glm5Model::spec_tail_head(FastState* F, int64_t p, float** lg_out, int** tk_out, const char* what,
+                               std::string& err) {
+    const Glm5Geometry& g = g_;
+    // R39: this position's ring slot.  With the merge the q8_1 input cannot be the ring slot's: both inputs have to sit
+    // one xq stride apart, and the pair buffer is where the block wrote its own already
+    float* hx = F->head_x_at(p);
+    void* hxq = F->head_xq_at(p);
+    float* lg = F->logits_at(p, sc_ + sc_logits);
+    int* tk = F->tok_at(p);
+    const WSlot& ow = ws_map_.at("output.weight");
+    const bool merge =
+        F->mtp_head_deferred && F->mtp_hxq_pair != nullptr && F->mtp_hx_pair != nullptr && ow.type != 0;
+    if (merge) hxq = F->mtp_hxq_pair;
+    glmres::res_head(g, state_, w_.at("output_norm.weight"), hx, hxq, F->cs);   // glm-dsa B2.3
+    mtp_carry_note(p, hx, F->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
+    gf::MvJob o = {ow.q, hxq, hx, merge ? F->mtp_hx_pair : lg, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
+    if (ow.type == 0) o.w = ow.f32;
+    if (merge) {
+        o.ncol = 2;
+        o.xq_cstride = (int64_t) (g.n_embd / 32) * 36;   // q8_1: 36 B a 32-value block
+        o.y_cstride = g.n_vocab;
+    }
+    if (!gf::mv(&o, 1, F->cs)) {
+        err = what;
+        return false;
+    }
+    if (merge) {
+        // column 0 is the trunk's: back into the ring slot the rest of the path reads.  column 1 is the draft's
+        cudaMemcpyAsync(lg, F->mtp_hx_pair, (size_t) g.n_vocab * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+        if (!mtp_head_finish(err)) return false;
+    }
+    *lg_out = lg;
+    *tk_out = tk;
+    return true;
+}
+
+// R44: the draft head fast_mtp left to that launch - its column of the pair buffer into mtp_logits (everything
+// downstream reads that buffer), then the pick and the read-back fast_mtp would have made itself.
+bool Glm5Model::mtp_head_finish(std::string& err) {
+    FastState* F = fast_;
+    if (F == nullptr || !F->mtp_head_deferred) return true;
+    F->mtp_head_deferred = false;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    cudaMemcpyAsync(F->mtp_logits, F->mtp_hx_pair + (size_t) g.n_vocab, (size_t) g.n_vocab * sizeof(float),
+                    cudaMemcpyDeviceToDevice, s);
+    if (mtp_sample_ != nullptr && F->spec_q != nullptr && F->mtp_head_step == 0)   // (as fast_mtp: decode_spec's)
+        strata::kernels::sample_draft(F->mtp_logits, 1, g.n_vocab, *mtp_sample_,
+                                      (strata::kernels::SpecList*) F->spec_q, F->mtp_tok + F->mtp_head_step, s);
+    else
+        gf::argmax(F->mtp_logits, g.n_vocab, F->mtp_tok + F->mtp_head_step, s, nullptr, 0);
+    if (F->mtp_head_read_back) {
+        cudaMemcpyAsync(F->mtp_tok_h + F->mtp_head_step, F->mtp_tok + F->mtp_head_step, sizeof(int),
+                        cudaMemcpyDeviceToHost, s);
+        cudaEventRecord(F->ev_mtp, s);
+    }
+    (void) err;
+    return true;
+}
+
 // the tail half (this) for position p: waits on the head's hop slot ON THE DEVICE, then its layers, the head and the
 // argmax/sampler (tok_h after ev_done)
 bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
@@ -7934,20 +8055,9 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
         }
         cudaSetDevice(m->dev_);
         FastState* FL = m->fast_;
-        // R39: this position's ring slot
-        float* hx = FL->head_x_at(p);
-        void* hxq = FL->head_xq_at(p);
-        float* lg = FL->logits_at(p, m->sc_ + m->sc_logits);
-        int* tk = FL->tok_at(p);
-        glmres::res_head(g, m->state_, m->w_.at("output_norm.weight"), hx, hxq, FL->cs);   // glm-dsa B2.3
-        m->mtp_carry_note(p, hx, FL->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
-        const WSlot& owl = m->ws_map_.at("output.weight");
-        gf::MvJob ol = {owl.q, hxq, hx, lg, nullptr, 1.0f, owl.type, g.n_embd, g.n_vocab};
-        if (owl.type == 0) ol.w = owl.f32;
-        if (!gf::mv(&ol, 1, FL->cs)) {
-            err = "glm spec: output head";
-            return false;
-        }
+        float* lg = nullptr;
+        int* tk = nullptr;
+        if (!m->spec_tail_head(FL, p, &lg, &tk, "glm spec: output head", err)) return false;
         if (m->fast_->prof_on) m->fast_->mark("head_mv");
         enqueue_pick(m, FL, p, lg, tk);
         m->spec_span_end();
@@ -7955,19 +8065,9 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
         return true;
     }
     // R39: the non-split tail (a group of ONE part) - the branch R38 forgot
-    float* hx = F->head_x_at(p);
-    void* hxq = F->head_xq_at(p);
-    float* lg = F->logits_at(p, sc_ + sc_logits);
-    int* tk = F->tok_at(p);
-    glmres::res_head(g, state_, w_.at("output_norm.weight"), hx, hxq, F->cs);   // glm-dsa B2.3
-    mtp_carry_note(p, hx, F->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
-    const WSlot& ow = ws_map_.at("output.weight");
-    gf::MvJob o = {ow.q, hxq, hx, lg, nullptr, 1.0f, ow.type, g.n_embd, g.n_vocab};
-    if (ow.type == 0) o.w = ow.f32;
-    if (!gf::mv(&o, 1, F->cs)) {
-        err = "glm spec: output head";
-        return false;
-    }
+    float* lg = nullptr;
+    int* tk = nullptr;
+    if (!spec_tail_head(F, p, &lg, &tk, "glm spec: output head", err)) return false;
     if (F->prof_on) F->mark("head_mv");
     enqueue_pick(this, F, p, lg, tk);
     spec_span_end();
@@ -8147,20 +8247,9 @@ bool Glm5Model::spec_tail_back(Glm5Model* head, int64_t p, std::string& err) {
     m->spec_span_take();
     if (sprof) m->spec_dev_take();
     if (!m->spec_hop_in(prev, p, sprof, err)) return false;
-    // R39: this position's ring slot
-    float* hx = FL->head_x_at(p);
-    void* hxq = FL->head_xq_at(p);
-    float* lg = FL->logits_at(p, m->sc_ + m->sc_logits);
-    int* tk = FL->tok_at(p);
-    glmres::res_head(g, m->state_, m->w_.at("output_norm.weight"), hx, hxq, FL->cs);   // glm-dsa B2.3
-    m->mtp_carry_note(p, hx, FL->cs);   // glm-dsa B15.3: the NextN carrier of this sequence
-    const WSlot& owl = m->ws_map_.at("output.weight");
-    gf::MvJob ol = {owl.q, hxq, hx, lg, nullptr, 1.0f, owl.type, g.n_embd, g.n_vocab};
-    if (owl.type == 0) ol.w = owl.f32;
-    if (!gf::mv(&ol, 1, FL->cs)) {
-        err = "glm spec: output head";
-        return false;
-    }
+    float* lg = nullptr;
+    int* tk = nullptr;
+    if (!m->spec_tail_head(FL, p, &lg, &tk, "glm spec: output head", err)) return false;
     if (m->fast_->prof_on) m->fast_->mark("head_mv");
     gf::argmax(lg, g.n_vocab, tk, FL->cs);
     cudaMemcpyAsync(FL->tok_h_at(p), tk, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
@@ -8605,6 +8694,9 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             //     (stream order).  The host waits for it after enqueuing the tail's pass below.
             int64_t dp = q + 1;
             cudaSetDevice(TL->dev_);
+            // R44: MAYA_GLM_HEAD_MERGE - this round's draft head goes into the tail's head launch just below, as its
+            // second column (fast_mtp leaves it there; spec_tail/spec_tail_back takes it)
+            TL->fast_->mtp_head_merge_arm = head_merge_on();
             // R41: MAYA_GLM_MTP_STREAM=1 runs the draft on its own stream: the tail's next position no longer queues
             // behind it (and the draft does not queue behind that position).  The draft waits for the token event of
             // dp, which is recorded after the tail wrote head_x(dp) and the carrier row of dp; both are per-position
@@ -8626,6 +8718,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
                 TL->fast_->cs = sv;
                 if (!okd) { ok = false; break; }
             } else if (!TL->fast_mtp(dp, y2, err)) { ok = false; break; }
+            TL->fast_->mtp_head_merge_arm = false;
             // (4) the tail's next position goes in first: it waits for the head's hop on the device and starts its
             //     layers while the host waits for the draft (and the head group's next enqueue).
             //     R30: with the front already standing (CUDA2 at q+2), only the last part is left - spec_tail_back.

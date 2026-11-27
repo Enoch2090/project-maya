@@ -555,6 +555,17 @@ struct Glm5Model::FastState {
     int* tok_at(int64_t p) { const int i = head_ring_slot(p); return i == 0 ? tok : tok_r[i]; }
     int* tok_h_at(int64_t p) { const int i = head_ring_slot(p); return i == 0 ? tok_h : tok_h_r[i]; }
     cudaEvent_t ev_done_at(int64_t p) { const int i = head_ring_slot(p); return i == 0 ? ev_done : ev_done_r[i]; }
+    // R44 (MAYA_GLM_HEAD_MERGE): the draft block's head as the trunk's head launch's SECOND column, so one pass over
+    // output.weight serves both.  mtp_hxq_pair holds the trunk's q8_1 input and the block's, one xq stride apart;
+    // mtp_hx_pair their two logits buffers, one vocabulary apart.  fast_mtp fills the block's side and returns, the
+    // trunk's head (spec_tail_head) runs both and picks (mtp_head_finish) - see glm_fast_path.cu.
+    void* mtp_hxq_pair = nullptr;
+    float* mtp_hx_pair = nullptr;
+    bool mtp_head_merge_arm = false;   // this step's head is to be left to the trunk's launch (decode_spec sets it)
+    bool mtp_head_deferred = false;    // ... it was, and the trunk's launch has not run it yet
+    int mtp_head_step = 0;
+    bool mtp_head_read_back = false;
+    int mtp_head_n_out = 0;
     // the NextN block (the half that carries it): its residual, eh_proj's q8_1 input, its logits and token
     float* mtp_h = nullptr;
     void* mtp_catq = nullptr;

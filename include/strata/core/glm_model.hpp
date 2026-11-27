@@ -807,6 +807,13 @@ public:
     bool hop_to_next(Glm5Model* B, int64_t p, std::string& err);
     bool spec_head(int64_t p, int32_t token, std::string& err);
     bool spec_tail(Glm5Model* head, int64_t p, std::string& err);
+    /// R44 (MAYA_GLM_HEAD_MERGE): a tail part's output head for position p - output_norm, its q8_1 form and the head
+    /// GEMV - with the draft block's head as a second column of the same launch when fast_mtp has just left one for it
+    /// (mtp_head_deferred).  Writes the trunk's logits to *lg and its picked token buffer to *tk as the one-column
+    /// launch did, and finishes the draft's own logits/pick/read-back (mtp_head_finish).
+    bool spec_tail_head(FastState* F, int64_t p, float** lg, int** tk, const char* what, std::string& err);
+    /// ... the draft head's pick and read-back after that launch (no-op when none was deferred)
+    bool mtp_head_finish(std::string& err);
     /// The one-GPU MTP decode (src/core/glm_mtp.cu): each round the NextN block drafts up to n tokens in a chain (its
     /// own hidden state feeding the next step), one verify window (window()) checks [last token, drafts...], the
     /// target's samples accept the drafts while they match (window_commit keeps them), and the NextN block's cache takes
