@@ -708,7 +708,7 @@ public:
     // step ran (several conversations' steps queued together, glm_mtp_rows.cu) - copied in, no wait for the stream
     // head = false: the block up to the head's input (head_x / head_xq), no head and no pick
     bool fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step = 0, bool sub = false, bool read_back = true,
-                  const float* emb_staged = nullptr, bool head = true);
+                  const float* emb_staged = nullptr, bool head = true, const float* carry = nullptr);
     void mtp_draft_setup(bool chain = true);               // fast_setup: the draft head's rows, the chain's embeddings
     // the draft vocabulary (load_pack, from the GGUF's tokenizer - see glm_mtp.cu): ids [0, mtp_vlead_) and
     // mtp_vextra_; mtp_vin_[id] != 0 for each (empty: the whole head)

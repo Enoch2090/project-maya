@@ -7126,7 +7126,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
 //     round trip.  Else the host dequantizes the token's row: through mtp_emb_h where the chain is set up (its last
 //     copy out waited for alone), else through emb_h after a sync of the stream (it may still feed an earlier copy).
 bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step, bool sub, bool read_back,
-                         const float* emb_staged, bool head) {
+                         const float* emb_staged, bool head, const float* carry) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
@@ -7179,7 +7179,10 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     }
     // R39: the carrier-off fallback is the TRUNK's hidden state of position p, so it comes from p's ring slot
     // (slot 0 = plain head_x when the ring is off).  The block's own head_x / head_xq below are its scratch.
-    gf::mtp_in(F->emb, mtp_carry_row(p, F->head_x_at(p), s), Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);   // glm-dsa B15.3 (Flash: head_x)
+    // R42: a chained step may hand its carrier in directly - the block's own hidden state of the step before it, read
+    // on the same stream before this step overwrites the buffer - so the shared carrier ring the tail keeps is untouched
+    gf::mtp_in(F->emb, carry != nullptr ? carry : mtp_carry_row(p, F->head_x_at(p), s), Ly.enorm, Ly.hnorm, g.norm_eps,
+               E, F->mtp_catq, s);   // glm-dsa B15.3 (Flash: head_x)
     gf::MvJob eh = {Ly.eh.q, F->mtp_catq, nullptr, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
     if (!glmdsa::mv(F->dsa.get(), &eh, 1, s)) {   // glm-dsa B2.4: a BF16/F32 eh_proj reads the dequantized input
         err = "glm mtp: eh_proj";
@@ -8428,6 +8431,44 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     static const bool sprof = getenv("MAYA_GLM_SPEC_PROF") != nullptr;
     double tp[6] = {0, 0, 0, 0, 0, 0};
     int64_t np = 0;
+    // R42 probe (MAYA_GLM_MTP_CHAIN2=1): a SECOND chained step of the draft block in the same round, and the count of
+    // how often that second draft matched the token produced 1, 2 and 3 rounds later.  Nothing of it feeds the token
+    // stream.  It is the only way to price a 2-ahead draft (depth 3, the one road to 30 tok/s) before building it: the
+    // step's token is the draft this round made (the host already has it) and its carrier is the block's own hidden
+    // state of that step, so the round's drafts, the tail's next position and the head's enqueue are untouched.
+    static const bool c2_want = [] {
+        const char* v = getenv("MAYA_GLM_MTP_CHAIN2");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    struct Chain2 {
+        enum { kSlots = 8 };               // rounds in flight (the check reads 3 rounds back)
+        int* h = nullptr;                  // pinned, one int per slot: that round's second draft
+        cudaEvent_t ev[kSlots] = {};
+        int64_t made[kSlots] = {};         // the round that filled the slot (-1: empty)
+        int32_t prev[kSlots] = {};         // its token, the fallback draft_id keeps
+        long long hit[4] = {}, reach[4] = {};
+        int said = 0;                      // the by-eye samples printed (6 at most)
+    } c2;
+    bool c2_on = false;
+    if (c2_want) {
+        cudaSetDevice(TL->dev_);
+        bool fine = cudaHostAlloc((void**) &c2.h, sizeof(int) * Chain2::kSlots, cudaHostAllocDefault) == cudaSuccess;
+        for (int i = 0; fine && i < Chain2::kSlots; ++i)
+            fine = cudaEventCreateWithFlags(&c2.ev[i], cudaEventDisableTiming) == cudaSuccess;
+        for (int i = 0; i < Chain2::kSlots; ++i) c2.made[i] = -1;
+        if (!fine) {
+            cudaGetLastError();
+            for (int i = 0; i < Chain2::kSlots; ++i)
+                if (c2.ev[i] != nullptr) cudaEventDestroy(c2.ev[i]);
+            if (c2.h != nullptr) cudaFreeHost(c2.h);
+            c2.h = nullptr;
+            std::fprintf(stderr, "glm spec: the chain-2 probe did not allocate - off\n");
+        } else {
+            c2_on = true;
+            std::fprintf(stderr, "glm spec: the draft takes a second chained step (MAYA_GLM_MTP_CHAIN2=1)\n");
+        }
+        cudaSetDevice(dev_);
+    }
     auto tnow = std::chrono::steady_clock::now();
     static const char* const lap_names[6] = {"wait tail", "draft", "redo", "enqueue tail", "enqueue head", "emit"};
     const auto lapn = [&](int i, int next) {   // next: the phase that follows (its NVTX range)
@@ -8466,6 +8507,31 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         }
         stall.step("the tail's token");
         if (!take(y2, q + 1)) { ok = false; break; }
+        if (c2_on) {
+            // the second draft of k rounds ago against this round's token: 2 is the offset the chain aims at (the token
+            // after the one the first draft guesses); 1 and 3 come along as the alignment's own check.  An entry lives
+            // three rounds and is compared at each of them (it is dropped only when it is np - 3 old).
+            for (int k = 1; k <= 3; ++k) {
+                const int slot = (int) ((np - k) & (Chain2::kSlots - 1));
+                if (np - k < 0 || c2.made[slot] != np - k) continue;
+                if (cudaEventSynchronize(c2.ev[slot]) != cudaSuccess) {
+                    cudaGetLastError();
+                    c2_on = false;
+                    std::fprintf(stderr, "glm spec: the chain-2 probe lost its event - off\n");
+                    break;
+                }
+                const int32_t got = glmfast::draft_id(c2.h[slot], c2.prev[slot], (int) g_.n_vocab, "glm mtp chain2");
+                ++c2.reach[k];
+                if (got == y2) ++c2.hit[k];
+                if (c2.said < 6) {   // (the first few, by eye: the offset shows here if the counters confuse)
+                    ++c2.said;
+                    std::fprintf(stderr, "glm mtp chain2 sample (k=%d): the second draft %d, the round's token %d\n", k,
+                                 got, y2);
+                }
+            }
+            const int old3 = (int) ((np - 3) & (Chain2::kSlots - 1));
+            if (np - 3 >= 0 && c2.made[old3] == np - 3) c2.made[old3] = -1;
+        }
         lapn(0, early ? 2 : 1);
         ++produced;
         ng.push(y2);   // glm-dsa B14.13
@@ -8572,6 +8638,29 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             if (!glmfast::wait_event(TL->fast_->ev_mtp, "glm spec draft", err)) { ok = false; break; }
             d2 = draft_ok(ng.pick(draft_ok(TL->fast_->mtp_tok_h[0], y2)), y2);   // glm-dsa B14.13 (as above)
             if (!TL->fast_->route_ok(err)) { ok = false; break; }
+            if (c2_on) {
+                // R42: the chain's second step, on the draft's stream where it has one: token = the draft just made (the
+                // host has it), carrier = the block's own hidden state of that step (this step's own read of it is
+                // ordered before its write - one stream), argmax read back into the probe's ring, never waited for here
+                const int slot = (int) (np & (Chain2::kSlots - 1));
+                cudaSetDevice(TL->dev_);
+                const cudaStream_t sv2 = TL->fast_->cs;
+                if (mtp_stream && TL->fast_->cs_mtp != nullptr) TL->fast_->cs = TL->fast_->cs_mtp;
+                std::string e2;
+                bool ok2 = TL->fast_mtp(dp + 1, d2, e2, 1, false, true, nullptr, true, TL->fast_->head_x);
+                if (ok2)
+                    ok2 = cudaMemcpyAsync(c2.h + slot, TL->fast_->mtp_tok + 1, sizeof(int), cudaMemcpyDeviceToHost,
+                                          TL->fast_->cs) == cudaSuccess &&
+                          cudaEventRecord(c2.ev[slot], TL->fast_->cs) == cudaSuccess;
+                TL->fast_->cs = sv2;
+                c2.made[slot] = ok2 ? np : -1;
+                c2.prev[slot] = d2;
+                if (!ok2) {
+                    cudaGetLastError();
+                    c2_on = false;
+                    std::fprintf(stderr, "glm spec: the chain-2 probe failed - off (%s)\n", e2.c_str());
+                }
+            }
             lap(1);
             have_draft = true;
             // (3) the head's speculative position q+2 stood iff its draft was y2 (redone above otherwise)
@@ -8624,6 +8713,19 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
                 std::fprintf(stderr, "glm spec prof CUDA%d (%lld tokens): DEVICE token %.2f ms (tail part)\n", m->dev_,
                              (long long) m->spec_dev_n_, m->spec_dev_ms_ / (double) m->spec_dev_n_);
 
+    }
+    if (c2.h != nullptr) {   // R42 probe: the second chained draft's acceptance, counted in rounds
+        if (c2.reach[1] + c2.reach[2] + c2.reach[3] > 0)
+            std::fprintf(stderr,
+                         "glm mtp chain2 (%lld rounds): the second draft matched the token 1/2/3 rounds later on "
+                         "%lld/%lld, %lld/%lld, %lld/%lld\n",
+                         (long long) np, c2.hit[1], c2.reach[1], c2.hit[2], c2.reach[2], c2.hit[3], c2.reach[3]);
+        cudaSetDevice(TL->dev_);
+        for (int i = 0; i < Chain2::kSlots; ++i)
+            if (c2.ev[i] != nullptr) cudaEventDestroy(c2.ev[i]);
+        cudaFreeHost(c2.h);
+        c2.h = nullptr;
+        cudaSetDevice(dev_);
     }
     if (getenv("MAYA_GLM_SPEC_GAP") != nullptr)   // R20: the per-card span and idle, no synchronise in the instrument
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
