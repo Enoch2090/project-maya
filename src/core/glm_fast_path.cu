@@ -893,6 +893,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     if (const char* rs = getenv("MAYA_GLM_RAM_SLACK")) F->ram_slack = std::max(0, std::atoi(rs));
     else if (F->ram_resident) F->ram_slack = 16;
     if (cudaStreamCreateWithFlags(&F->cs, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&F->cs_mtp, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->copy, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->ps, cudaStreamNonBlocking) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_hop, cudaEventDisableTiming) != cudaSuccess ||
@@ -5903,6 +5904,20 @@ void Glm5Model::fast_ahead_reader() {
 // (3) every layer's spares are refilled - from free slots, else by evicting the layer's least-used resident
 // (demoted into the RAM tier when it beats the RAM tier's least-used, dropped otherwise); (4) the RAM tier keeps
 // a few free slots for disk reads.  The table edits ride one small update kernel at the head of the next token.
+// R41: MAYA_GLM_SPEC_BOUNDARY_N=<n> (default 1 = every position, as before): the spec path's boundary - and the
+// stream sync it needs before it may rewrite the expert pool's table - runs once every n positions of this part.
+// In between nothing migrates (the pool holds 99.5% of the routes, `ram fetches 0.00/token`), so the arithmetic does
+// not change; what changes is that the host may enqueue the next position while this one is still running, which is
+// what lets a group's two cards each run a position of their own instead of alternating.
+bool Glm5Model::spec_bnd_due() {
+    static const int every = [] {
+        const char* v = getenv("MAYA_GLM_SPEC_BOUNDARY_N");
+        return v != nullptr ? std::max(1, std::atoi(v)) : 1;
+    }();
+    if (every <= 1 || fast_ == nullptr) return true;
+    return ((fast_->spec_bnd_i++) % every) == 0;
+}
+
 bool Glm5Model::fast_boundary(std::string& err) {
     FastState* F = fast_;
     if (F == nullptr || F->lp.empty() || F->rc.empty()) return true;
@@ -7721,7 +7736,9 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     // sync the FIRST head part (this) and enqueue its layers BEFORE waiting for the later head parts (hl): on a wrong
     // draft, CUDA0 finishes the redo q+2 ~8 ms before CUDA1 finishes q+2, so CUDA0 can start q+3 immediately in
     // parallel with CUDA1's q+2 pass using double-buffered hop slot hsl = spec_n_ & 1
-    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec head sync", err) || !F->route_ok(err)) return false;
+    const bool bnd_h = spec_bnd_due();   // R41: every n positions only (MAYA_GLM_SPEC_BOUNDARY_N)
+    if (bnd_h ? (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec head sync", err) || !F->route_ok(err))
+              : !F->route_ok(err)) return false;
     spec_span_take();    // R20: the span and idle of two positions ago (no wait: this stream is idle now)
     spec_span_start();   // ... and this position begins
     // MAYA_GLM_SPEC_CANCEL: a speculative pass (decode_spec says so) reads the live word before every layer; it is
@@ -7753,7 +7770,7 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
         cudaEventRecord(spec_ev_[0], F->cs);
     }
     if (F->prof_on) F->collect();
-    if (!fast_boundary(err)) return false;
+    if (bnd_h && !fast_boundary(err)) return false;
     lap(1);
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
     tt->to_float(pack_emb_src_ + (size_t) token * ggml_row_size((ggml_type) pack_emb_type_, g.n_embd), F->emb_h,
@@ -7830,11 +7847,12 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
         spec_t_[i] += std::chrono::duration<double, std::milli>(t - t0).count();
         t0 = t;
     };
-    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec tail sync", err)) return false;
+    const bool bnd_f = spec_bnd_due();   // R41: every n positions only
+    if (bnd_f && !glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec tail sync", err)) return false;
     spec_span_take();
     lap(0);
     if (F->prof_on) F->collect();
-    if (!fast_boundary(err)) return false;
+    if (bnd_f && !fast_boundary(err)) return false;
     lap(1);
     ++spec_n_;
     pos_ = p + 1;
@@ -7898,11 +7916,13 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
             cudaEventRecord(che, FA->cs);
             m->spec_span_end();   // R20: this part's work for the position is done at its hop out
             cudaSetDevice(next->dev_);
-            if (!glmfast::cuda_ok(cudaStreamSynchronize(FB->cs), "glm spec tail part sync", err) ||
-                !FB->route_ok(err)) return false;
+            const bool bnd_n = next->spec_bnd_due();   // R41: every n positions only
+            if (bnd_n ? (!glmfast::cuda_ok(cudaStreamSynchronize(FB->cs), "glm spec tail part sync", err) ||
+                         !FB->route_ok(err))
+                      : !FB->route_ok(err)) return false;
             next->spec_span_take();
             if (FB->prof_on) FB->collect();
-            if (!next->fast_boundary(err)) return false;
+            if (bnd_n && !next->fast_boundary(err)) return false;
             next->pos_ = p + 1;
             cudaStreamWaitEvent(FB->cs, che, 0);
             next->spec_span_start();
@@ -8068,11 +8088,12 @@ bool Glm5Model::spec_tail_front(Glm5Model* head, int64_t p, std::string& err) {
         spec_t_[i] += std::chrono::duration<double, std::milli>(t - t0).count();
         t0 = t;
     };
-    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec tail sync", err)) return false;
+    const bool bnd_f = spec_bnd_due();   // R41: every n positions only
+    if (bnd_f && !glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec tail sync", err)) return false;
     spec_span_take();
     lap(0);
     if (F->prof_on) F->collect();
-    if (!fast_boundary(err)) return false;
+    if (bnd_f && !fast_boundary(err)) return false;
     lap(1);
     ++spec_n_;
     pos_ = p + 1;
@@ -8116,8 +8137,10 @@ bool Glm5Model::spec_tail_back(Glm5Model* head, int64_t p, std::string& err) {
     Glm5Model* m = prev->split_next_.get();
     FastState* FL = m->fast_;
     cudaSetDevice(m->dev_);
-    if (!glmfast::cuda_ok(cudaStreamSynchronize(FL->cs), "glm spec tail part sync", err) || !FL->route_ok(err) ||
-        !m->fast_boundary(err)) return false;
+    const bool bnd_b = m->spec_bnd_due();   // R41: every n positions only
+    if (bnd_b ? (!glmfast::cuda_ok(cudaStreamSynchronize(FL->cs), "glm spec tail part sync", err) || !FL->route_ok(err) ||
+                 !m->fast_boundary(err))
+              : !FL->route_ok(err)) return false;
     m->spec_span_take();
     if (sprof) m->spec_dev_take();
     if (!m->spec_hop_in(prev, p, sprof, err)) return false;
@@ -8516,7 +8539,27 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             //     (stream order).  The host waits for it after enqueuing the tail's pass below.
             int64_t dp = q + 1;
             cudaSetDevice(TL->dev_);
-            if (!TL->fast_mtp(dp, y2, err)) { ok = false; break; }
+            // R41: MAYA_GLM_MTP_STREAM=1 runs the draft on its own stream: the tail's next position no longer queues
+            // behind it (and the draft does not queue behind that position).  The draft waits for the token event of
+            // dp, which is recorded after the tail wrote head_x(dp) and the carrier row of dp; both are per-position
+            // (MAYA_GLM_SPEC_HEAD_RING>=2 keeps the row the draft reads until the tail's next position wrote its own).
+            static const bool mtp_stream = [] {
+                const char* v = getenv("MAYA_GLM_MTP_STREAM");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            if (mtp_stream && TL->fast_->cs_mtp != nullptr) {
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    std::fprintf(stderr, "glm spec: the draft runs on its own stream (MAYA_GLM_MTP_STREAM=1)\n");
+                }
+                cudaStreamWaitEvent(TL->fast_->cs_mtp, TL->fast_->ev_done_at(dp), 0);
+                const cudaStream_t sv = TL->fast_->cs;
+                TL->fast_->cs = TL->fast_->cs_mtp;
+                const bool okd = TL->fast_mtp(dp, y2, err);
+                TL->fast_->cs = sv;
+                if (!okd) { ok = false; break; }
+            } else if (!TL->fast_mtp(dp, y2, err)) { ok = false; break; }
             // (4) the tail's next position goes in first: it waits for the head's hop on the device and starts its
             //     layers while the host waits for the draft (and the head group's next enqueue).
             //     R30: with the front already standing (CUDA2 at q+2), only the last part is left - spec_tail_back.

@@ -853,6 +853,7 @@ private:
 public:
     // glm-dsa B11.2 (speed, glm_fast_path.cu): spec_tail in two halves around the draft (MAYA_GLM_SPEC_DRAFT_EARLY),
     // hop_to_next in two halves, and a tail part's MAYA_GLM_SPEC_PROF device span
+    bool spec_bnd_due();   // R41: MAYA_GLM_SPEC_BOUNDARY_N - is this position's boundary (and its sync) due
     bool spec_tail_front(Glm5Model* head, int64_t p, std::string& err);
     bool spec_tail_back(Glm5Model* head, int64_t p, std::string& err);
     void spec_hop_out(int64_t p, bool prof);

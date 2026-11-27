@@ -454,6 +454,13 @@ namespace glmtier { struct TierState; }   // glm-dsa B8.2-B8.4: src/core/glm_tie
 struct Glm5Model::FastState {
     bool unified_memory = false;   // set for integrated devices on Linux (HIP APUs, CUDA's GB10 / Grace); Windows keeps the discrete policy
     cudaStream_t cs = nullptr, copy = nullptr, ps = nullptr;   // ps: the prefetch side stream
+    // R41: MAYA_GLM_MTP_STREAM=1 - the MTP draft's own stream, so the tail's next position does not queue behind
+    // the draft (the draft is ~316 MB of head rows + the block; it sat ahead of every tail position on cs).
+    cudaStream_t cs_mtp = nullptr;
+    // R41: MAYA_GLM_SPEC_BOUNDARY_N=<n> - the spec path's per-position boundary (and its stream sync) once every n
+    // positions of this part; in between, the tier's migrations freeze and the host may enqueue the next position while
+    // this one runs (the whole point: a group's two cards each run a position of their own).
+    int spec_bnd_i = 0;
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
     int max_pf = 0;   // MAYA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};
